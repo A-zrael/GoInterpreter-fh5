@@ -4,6 +4,11 @@ type Sample struct {
 	Time     float64
 	Speed    float64
 	AccelX   float64
+	AccelY   float64
+	AccelZ   float64
+	VelX     float64
+	VelY     float64
+	VelZ     float64
 	SmoothAx float64
 }
 

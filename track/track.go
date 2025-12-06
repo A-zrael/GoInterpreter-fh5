@@ -6,25 +6,19 @@ import (
 	"math"
 )
 
-// TrackPoint – as you already have it
-type TrackPoint struct {
-	S     float64
-	X     float64
-	Y     float64
-	Theta float64
-}
-
 // --- MASTER LAP BUILDING ---
 
 // BuildMasterLap v2: resample each lap, align to lap 1, then average.
+// lapIdx should contain start indices for each lap, with a final boundary
+// equal to len(points) (end-exclusive).
 func BuildMasterLap(points []models.Trackpoint, lapIdx []int, samples int) []models.Trackpoint {
 	if len(lapIdx) < 2 || samples < 2 {
 		return nil
 	}
 
-	// Make sure final boundary reaches end of slice
-	if lapIdx[len(lapIdx)-1] != len(points)-1 {
-		lapIdx = append(lapIdx, len(points)-1)
+	// Make sure final boundary reaches end of slice (end-exclusive).
+	if lapIdx[len(lapIdx)-1] != len(points) {
+		lapIdx = append(lapIdx, len(points))
 	}
 
 	// 1) Resample each lap to 'samples' points
@@ -32,10 +26,14 @@ func BuildMasterLap(points []models.Trackpoint, lapIdx []int, samples int) []mod
 	for i := 0; i < len(lapIdx)-1; i++ {
 		start := lapIdx[i]
 		end := lapIdx[i+1]
+		if end > len(points) {
+			end = len(points)
+		}
 		if end <= start+1 {
 			continue
 		}
-		lap := resampleLap(points, start, end, samples)
+		lap := NormalizeLapSegment(points[start:end])
+		lap = resampleLap(lap, 0, len(lap), samples)
 		if lap != nil {
 			laps = append(laps, lap)
 		}
@@ -169,19 +167,48 @@ func alignLapToRef(ref, lap []models.Trackpoint) []models.Trackpoint {
 		sinT = b / denom
 	}
 
+	// Compute optimal isotropic scale to minimize SSE after rotation.
+	var num, den float64
+	for i := 0; i < n; i++ {
+		lx := lap[i].X - cxLap
+		ly := lap[i].Y - cyLap
+		rx := ref[i].X - cxRef
+		ry := ref[i].Y - cyRef
+		rxPrime := cosT*lx - sinT*ly
+		ryPrime := sinT*lx + cosT*ly
+		num += rx*rxPrime + ry*ryPrime
+		den += lx*lx + ly*ly
+	}
+	scale := 1.0
+	if den > 0 {
+		scale = num / den
+	}
+
 	out := make([]models.Trackpoint, n)
 	for i := 0; i < n; i++ {
 		dx := lap[i].X - cxLap
 		dy := lap[i].Y - cyLap
 
-		x := cosT*dx - sinT*dy + cxRef
-		y := sinT*dx + cosT*dy + cyRef
+		x := (cosT*dx - sinT*dy) * scale
+		y := (sinT*dx + cosT*dy) * scale
+		x += cxRef
+		y += cyRef
 
 		out[i] = models.Trackpoint{
 			S:     lap[i].S, // local S stays as-is
 			X:     x,
 			Y:     y,
 			Theta: lap[i].Theta, // you can adjust if you like
+		}
+	}
+
+	// Anchor start point to reference start to reduce rotational/translation smear.
+	shiftX := ref[0].X - out[0].X
+	shiftY := ref[0].Y - out[0].Y
+	if shiftX != 0 || shiftY != 0 {
+		for i := 0; i < n; i++ {
+			out[i].X += shiftX
+			out[i].Y += shiftY
 		}
 	}
 
@@ -193,98 +220,126 @@ func BuildTrack(samples []models.Sample) ([]models.Trackpoint, error) {
 		return nil, errors.New("not enough samples")
 	}
 
-	const minDT = 0.016
-	const maxDT = 0.25
+	const (
+		minDT    = 0.016
+		maxDT    = 0.25
+		minSpeed = 0.1
+	)
 
 	track := make([]models.Trackpoint, len(samples))
 
 	var (
-		x, y    float64
-		heading float64
-		dist    float64
+		x, y float64
+		dist float64
+		// Seed heading from velocity vector if present, else zero.
+		theta = math.Atan2(samples[0].VelZ, samples[0].VelX)
 	)
 
-	// JS initial behaviour:
-	samples[0].SmoothAx = samples[0].AccelX
-	track[0] = models.Trackpoint{S: 0, X: 0, Y: 0, Theta: 0}
+	if math.IsNaN(theta) || math.IsInf(theta, 0) {
+		theta = 0
+	}
+
+	samples[0].SmoothAx = cleanFloat(samples[0].AccelX, 0)
+	track[0] = models.Trackpoint{S: 0, X: 0, Y: 0, Theta: theta}
 
 	for i := 1; i < len(samples); i++ {
 		prev := samples[i-1]
 		cur := &samples[i] // pointer so we can modify SmoothAx
 
-		//
-		// 1. Compute dt (JS: (cur.timestampMS - prev.timestampMS)/1000
-		//
-		dt := (cur.Time - prev.Time) / 1000.0
-		if math.IsNaN(dt) || math.IsInf(dt, 0) || dt <= 0 || dt > maxDT {
-			dt = minDT
+		dt := cleanFloat(cur.Time-prev.Time, minDT)
+		dt = clamp(dt, minDT, maxDT)
+
+		curAccel := cleanFloat(cur.AccelX, 0)
+		cur.SmoothAx = prev.SmoothAx*0.85 + curAccel*0.15
+
+		speed := cleanFloat(cur.Speed, prev.Speed)
+		if speed < minSpeed {
+			speed = minSpeed
 		}
 
-		//
-		// 2. Accel smoothing (JS per-sample behaviour)
-		//    cur.smooth_ax = prev.smooth_ax * 0.85 + cur.accel_x * 0.15
-		//
-		ax := cur.AccelX
-		if math.IsNaN(ax) || math.IsInf(ax, 0) {
-			ax = 0
-		}
-
-		cur.SmoothAx = prev.SmoothAx*0.85 + ax*0.15
-
-		//
-		// 3. Speed fallback (JS truthiness: speed_mps || 0, then clamp >= 0.1)
-		//
-		speed := cur.Speed
-		if math.IsNaN(speed) || math.IsInf(speed, 0) {
-			speed = 0
-		}
-		if speed < 0.1 {
-			speed = 0.1
-		}
-
-		//
-		// 4. Yaw rate (JS: if speed > 2, yawRate = smooth_ax / speed)
-		//
 		yawRate := 0.0
 		if speed > 2.0 {
 			yawRate = cur.SmoothAx / speed
 		}
 
-		//
-		// 5. Update heading (JS: heading += yawRate * dt)
-		//
-		heading += yawRate * dt
+		theta += yawRate * dt
 
-		//
-		// 6. Integrate position
-		//    JS exact order:
-		//       dx = Math.cos(heading) * speed * dt
-		//       dy = Math.sin(heading) * speed * dt
-		//
-		dx := math.Cos(heading) * speed * dt
-		dy := math.Sin(heading) * speed * dt
+		dx := math.Cos(theta) * speed * dt
+		dy := math.Sin(theta) * speed * dt
+
 		x += dx
 		y += dy
 
-		//
-		// 7. Distance accumulation
-		//
 		dist += math.Hypot(dx, dy)
 
-		//
-		// 8. Store track point
-		//
 		track[i] = models.Trackpoint{
 			S:     dist,
 			X:     x,
 			Y:     y,
-			Theta: heading,
+			Theta: theta,
 		}
 	}
 
 	return track, nil
 }
+
+func clamp(v, min, max float64) float64 {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func cleanFloat(v, fallback float64) float64 {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return fallback
+	}
+	return v
+}
+
+// DetectLapsNearStart marks lap boundaries each time we come back near the start
+// point (within radius) after traveling at least minLapDistance since the
+// previous boundary. Indices include 0 as the first lap start.
+func DetectLapsNearStart(points []models.Trackpoint, radius float64, minLapDistance float64) []int {
+	if len(points) == 0 {
+		return nil
+	}
+
+	startX := points[0].X
+	startY := points[0].Y
+
+	r2 := radius * radius
+
+	indices := []int{0}
+	lastS := points[0].S
+
+	for i := 1; i < len(points); i++ {
+		dx := points[i].X - startX
+		dy := points[i].Y - startY
+		if dx*dx+dy*dy <= r2 && points[i].S-lastS >= minLapDistance {
+			indices = append(indices, i)
+			lastS = points[i].S
+		}
+	}
+
+	if indices[len(indices)-1] != len(points) {
+		indices = append(indices, len(points))
+	}
+
+	return indices
+}
 func FindLapIndicesByDistance(points []models.Trackpoint, expectedLap float64, tolerance float64) []int {
+	return FindLapIndicesByDistanceWithMin(points, expectedLap, tolerance, expectedLap*0.5)
+}
+
+// FindLapIndicesByDistanceWithMin marks a lap when cumulative S advances by
+// ~expectedLap (within tolerance) and by at least minLapDistance since the last
+// boundary. Use a generous minLapDistance to suppress false positives on noisy
+// integrations.
+func FindLapIndicesByDistanceWithMin(points []models.Trackpoint, expectedLap float64, tolerance float64, minLapDistance float64) []int {
 	if len(points) < 2 {
 		return nil
 	}
@@ -294,10 +349,14 @@ func FindLapIndicesByDistance(points []models.Trackpoint, expectedLap float64, t
 
 	for i := 1; i < len(points); i++ {
 		lapDist := points[i].S - lastS
-		if lapDist >= expectedLap-tolerance {
+		if lapDist >= expectedLap-tolerance && lapDist >= minLapDistance {
 			result = append(result, i)
 			lastS = points[i].S
 		}
+	}
+
+	if result[len(result)-1] != len(points) {
+		result = append(result, len(points))
 	}
 
 	return result
@@ -429,5 +488,28 @@ func CloseLoop(points []models.Trackpoint) []models.Trackpoint {
 	out[n-1].X = out[0].X
 	out[n-1].Y = out[0].Y
 
+	return out
+}
+
+// NormalizeLapSegment closes a lap drift and recomputes arc length so S starts
+// at 0 and ends at lap length derived from geometry.
+func NormalizeLapSegment(points []models.Trackpoint) []models.Trackpoint {
+	closed := CloseLoop(points)
+	return RecomputeArcLength(closed)
+}
+
+func RecomputeArcLength(points []models.Trackpoint) []models.Trackpoint {
+	if len(points) == 0 {
+		return points
+	}
+	out := make([]models.Trackpoint, len(points))
+	out[0] = points[0]
+	out[0].S = 0
+	for i := 1; i < len(points); i++ {
+		dx := points[i].X - points[i-1].X
+		dy := points[i].Y - points[i-1].Y
+		out[i] = points[i]
+		out[i].S = out[i-1].S + math.Hypot(dx, dy)
+	}
 	return out
 }
