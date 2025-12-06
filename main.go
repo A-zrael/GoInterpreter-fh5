@@ -2,78 +2,106 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"forza/models"
 	"forza/track"
-	"math"
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 func main() {
-
 	var filePaths multiFlag
 	flag.Var(&filePaths, "file", "Path to telemetry CSV file (repeatable)")
+	var folderPaths multiFlag
+	flag.Var(&folderPaths, "folder", "Folder containing telemetry CSV files (repeatable, recursive)")
 	lapLen := flag.Float64("lap-length", 0, "Expected lap length in meters (0 to autodetect by start crossing)")
 	lapTol := flag.Float64("lap-tol", 25, "Tolerance for lap length matching (meters)")
 	lapCount := flag.Int("lap-count", 0, "Known lap count; with lap-length=0, lap length is estimated as total distance / lap-count")
 	minLapSpacing := flag.Float64("min-lap-spacing", 200, "Minimum distance (m) between lap boundaries when using distance-based detection")
-	outputLaps := flag.Bool("lap-output", true, "When true, output Lap,RelS,X,Y columns using detected lap splits")
-	lapSelect := flag.Int("lap-select", 0, "If >0, only output this lap number (1-based) instead of all laps")
 	masterSamples := flag.Int("master-samples", 2000, "Resampled points per lap when building master lap")
 	useMaster := flag.Bool("use-master", true, "If true, output the averaged master lap instead of per-lap raw points")
 	flag.Parse()
 
-	if len(filePaths) == 0 {
-		filePaths = append(filePaths, "mockdata/gol1/Car-5030.csv")
+	// Collect input files from flags
+	inputFiles := append([]string{}, filePaths...)
+	if len(folderPaths) > 0 {
+		inputFiles = append(inputFiles, filesFromFolders(folderPaths)...)
+	}
+	if len(inputFiles) == 0 {
+		inputFiles = append(inputFiles, "mockdata/gol1/Car-5030.csv")
 	}
 
 	var (
 		allPoints   []models.Trackpoint
 		allLapIdx   []int
-		totalDist   float64
-		totalTime   float64
 		lapsAdded   int
 		sessionLogs []string
+		masterTrack []models.Trackpoint
+		sessions    []sessionResult
 	)
 	allLapIdx = append(allLapIdx, 0)
 
-	for _, path := range filePaths {
-		samples, err := LoadSamplesFromCSV(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error loading CSV %s: %v\n", path, err)
+	results := make(chan sessionResult, len(inputFiles))
+	var wg sync.WaitGroup
+	for _, path := range inputFiles {
+		wg.Add(1)
+		go func(p string) {
+			defer wg.Done()
+			samples, err := LoadSamplesFromCSV(p)
+			if err != nil {
+				results <- sessionResult{path: p, err: fmt.Errorf("load: %w", err)}
+				return
+			}
+			tp, err := track.BuildTrack(samples)
+			if err != nil {
+				results <- sessionResult{path: p, err: fmt.Errorf("track: %w", err)}
+				return
+			}
+			events := track.DetectEvents(samples)
+			sessionDist := tp[len(tp)-1].S
+			sessionTime := samples[len(samples)-1].Time - samples[0].Time
+			laps := track.DeriveLapCount(sessionDist, *lapCount)
+			lapIdx := track.BuildLapIdx(tp, laps, *lapLen, *lapTol, *minLapSpacing)
+			results <- sessionResult{
+				path:    p,
+				track:   tp,
+				samples: samples,
+				events:  events,
+				lapIdx:  lapIdx,
+				dist:    sessionDist,
+				dur:     sessionTime,
+			}
+		}(path)
+	}
+	wg.Wait()
+	close(results)
+
+	for res := range results {
+		if res.err != nil {
+			fmt.Fprintf(os.Stderr, "error %s: %v\n", res.path, res.err)
+			continue
+		}
+		if len(res.lapIdx) < 2 {
+			fmt.Fprintf(os.Stderr, "warning: no laps detected for %s, skipping\n", res.path)
 			continue
 		}
 
-		trackPoints, err := track.BuildTrack(samples)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error building track for %s: %v\n", path, err)
-			continue
-		}
-
-		sessionDist := trackPoints[len(trackPoints)-1].S
-		sessionTime := samples[len(samples)-1].Time - samples[0].Time
-		laps := deriveLapCount(sessionDist, *lapCount)
-		lapIdx := buildLapIdx(trackPoints, laps, *lapLen, *lapTol, *minLapSpacing)
-
-		if len(lapIdx) < 2 {
-			fmt.Fprintf(os.Stderr, "warning: no laps detected for %s, skipping\n", path)
-			continue
-		}
-
-		for i := 0; i < len(lapIdx)-1; i++ {
-			seg := trackPoints[lapIdx[i]:lapIdx[i+1]]
+		for i := 0; i < len(res.lapIdx)-1; i++ {
+			seg := res.track[res.lapIdx[i]:res.lapIdx[i+1]]
 			seg = track.NormalizeLapSegment(seg)
 			allPoints = append(allPoints, seg...)
 			allLapIdx = append(allLapIdx, len(allPoints))
 			lapsAdded++
 		}
 
-		totalDist += sessionDist
-		totalTime += sessionTime
-		sessionLogs = append(sessionLogs, fmt.Sprintf("%s laps=%d dist=%.1fm time=%.1fs", path, len(lapIdx)-1, sessionDist, sessionTime))
+		sessionLogs = append(sessionLogs, fmt.Sprintf("%s laps=%d dist=%.1fm time=%.1fs events=%d", res.path, len(res.lapIdx)-1, res.dist, res.dur, len(res.events)))
+		sessions = append(sessions, res)
 	}
 
 	if lapsAdded == 0 {
@@ -92,35 +120,170 @@ func main() {
 	if *useMaster && len(lapIdx) > 1 {
 		master := track.BuildMasterLap(trackPoints, lapIdx, *masterSamples)
 		if len(master) > 0 {
+			masterTrack = master
 			trackPoints = master
 			lapIdx = []int{0, len(master)}
 			fmt.Fprintf(os.Stderr, "using master lap (%d points) from %d input laps\n", len(master), lapsAdded)
 		}
 	}
 
-	if *lapSelect > 0 && *lapSelect < len(lapIdx) {
-		start := lapIdx[*lapSelect-1]
-		end := lapIdx[*lapSelect]
-		lapIdx = []int{start, end}
+	if masterTrack == nil {
+		masterTrack = track.BuildMasterLap(trackPoints, lapIdx, *masterSamples)
+	}
+	if len(masterTrack) == 0 {
+		fmt.Fprintf(os.Stderr, "master track not available for mapping\n")
+		os.Exit(1)
 	}
 
-	if *outputLaps {
-		fmt.Println("Lap,RelS,X,Y")
-		for lapNum := 1; lapNum < len(lapIdx); lapNum++ {
-			start := lapIdx[lapNum-1]
-			end := lapIdx[lapNum]
-			startS := trackPoints[start].S
-			for i := start; i < end; i++ {
-				relS := trackPoints[i].S - startS
-				fmt.Printf("%d,%.6f,%.6f,%.6f\n", lapNum, relS, trackPoints[i].X, trackPoints[i].Y)
-			}
-		}
-	} else {
-		fmt.Println("X,Y")
-		for _, p := range trackPoints {
-			fmt.Printf("%.6f,%.6f\n", p.X, p.Y)
-		}
+	type masterOut struct {
+		RelS float64 `json:"relS"`
+		X    float64 `json:"x"`
+		Y    float64 `json:"y"`
 	}
+	type eventOut struct {
+		Type       string  `json:"type"`
+		Source     string  `json:"source"`
+		Index      int     `json:"index"`
+		Time       float64 `json:"time"`
+		Note       string  `json:"note"`
+		Lap        int     `json:"lap,omitempty"`
+		RelS       float64 `json:"relS,omitempty"`
+		MasterIdx  int     `json:"masterIdx,omitempty"`
+		MasterRelS float64 `json:"masterRelS,omitempty"`
+		MasterX    float64 `json:"masterX,omitempty"`
+		MasterY    float64 `json:"masterY,omitempty"`
+		DistanceSq float64 `json:"distanceSq,omitempty"`
+	}
+	type carPoint struct {
+		Lap      int     `json:"lap"`
+		Heading  float64 `json:"heading"`
+		MasterX  float64 `json:"masterX"`
+		MasterY  float64 `json:"masterY"`
+		SpeedMPH float64 `json:"speedMPH"`
+		SpeedKMH float64 `json:"speedKMH"`
+		Gear     int     `json:"gear"`
+	}
+	type carOut struct {
+		Source   string             `json:"source"`
+		Points   []carPoint         `json:"points,omitempty"`
+		LapTimes []track.LapMetrics `json:"lapTimes,omitempty"`
+	}
+	out := struct {
+		Master []masterOut `json:"master"`
+		Events []eventOut  `json:"events,omitempty"`
+		Cars   []carOut    `json:"cars,omitempty"`
+	}{}
+
+	for _, p := range masterTrack {
+		out.Master = append(out.Master, masterOut{
+			RelS: p.S,
+			X:    p.X,
+			Y:    p.Y,
+		})
+	}
+
+	for _, sess := range sessions {
+		cOut := carOut{Source: sess.path}
+		// Lap times with embedded sector splits (3 sectors by default).
+		cOut.LapTimes = track.ComputeLapMetrics(sess.samples, sess.track, sess.lapIdx, 3)
+		for lapNum := 1; lapNum < len(sess.lapIdx); lapNum++ {
+			start := sess.lapIdx[lapNum-1]
+			end := sess.lapIdx[lapNum]
+			if start < 0 || end > len(sess.track) {
+				continue
+			}
+			segment := sess.track[start:end]
+			track.MapToMaster(segment, masterTrack, start, func(idx int, relS, x, y float64, mi int, mRelS, mx, my, dist float64) {
+				var heading, speedMPH, speedKMH float64
+				var gear int
+				if idx >= 0 && idx < len(sess.track) {
+					heading = sess.track[idx].Theta
+				}
+				if idx >= 0 && idx < len(sess.samples) {
+					speedMPH = sess.samples[idx].SpeedMPH
+					speedKMH = sess.samples[idx].SpeedKMH
+					gear = sess.samples[idx].Gear
+				}
+				cOut.Points = append(cOut.Points, carPoint{
+					Lap:      lapNum,
+					Heading:  heading,
+					MasterX:  mx,
+					MasterY:  my,
+					SpeedMPH: speedMPH,
+					SpeedKMH: speedKMH,
+					Gear:     gear,
+				})
+			})
+		}
+
+		for _, ev := range sess.events {
+			if ev.Index < 0 || ev.Index >= len(sess.track) {
+				continue
+			}
+			lapNum, relS := track.FindLapAndRelS(sess.lapIdx, sess.track, ev.Index)
+			px, py := sess.track[ev.Index].X, sess.track[ev.Index].Y
+			mi, mRelS, mx, my, dist := track.MapRelSToMaster(masterTrack, relS, px, py)
+			eo := eventOut{
+				Type:       ev.Type,
+				Source:     sess.path,
+				Index:      ev.Index,
+				Time:       ev.Time,
+				Note:       ev.Note,
+				Lap:        lapNum,
+				RelS:       relS,
+				MasterIdx:  mi,
+				MasterRelS: mRelS,
+				MasterX:    mx,
+				MasterY:    my,
+				DistanceSq: dist,
+			}
+			out.Events = append(out.Events, eo)
+		}
+
+		out.Cars = append(out.Cars, cOut)
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(out); err != nil {
+		fmt.Fprintf(os.Stderr, "error encoding json: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+type sessionResult struct {
+	path    string
+	track   []models.Trackpoint
+	samples []models.Sample
+	events  []models.Event
+	lapIdx  []int
+	dist    float64
+	dur     float64
+	err     error
+}
+
+func filesFromFolders(folders []string) []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, dir := range folders {
+		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: skipping %s: %v\n", path, err)
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if strings.HasSuffix(strings.ToLower(d.Name()), ".csv") {
+				if _, ok := seen[path]; !ok {
+					out = append(out, path)
+					seen[path] = struct{}{}
+				}
+			}
+			return nil
+		})
+	}
+	return out
 }
 
 func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
@@ -180,6 +343,19 @@ func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
 		vy := parseOrZero(row[cols["vel_y"]])
 		vz := parseOrZero(row[cols["vel_z"]])
 
+		var speedMPH, speedKMH float64
+		if idx, ok := cols["speed_mph"]; ok {
+			speedMPH = parseOrZero(row[idx])
+		}
+		if idx, ok := cols["speed_kmh"]; ok {
+			speedKMH = parseOrZero(row[idx])
+		}
+
+		gear := 0
+		if idx, ok := cols["gear"]; ok {
+			gear = int(parseOrZero(row[idx]))
+		}
+
 		samples = append(samples, models.Sample{
 			Time:     timeSec,
 			Speed:    speed,
@@ -189,64 +365,14 @@ func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
 			VelX:     vx,
 			VelY:     vy,
 			VelZ:     vz,
+			SpeedMPH: speedMPH,
+			SpeedKMH: speedKMH,
+			Gear:     gear,
 			SmoothAx: ax, // seed smoother with raw value
 		})
 	}
 
 	return samples, nil
-}
-
-// buildEvenLapIdx generates lap boundaries assuming 'laps' equally spaced laps
-// by distance across the session.
-func buildEvenLapIdx(points []models.Trackpoint, laps int) []int {
-	if laps < 1 || len(points) == 0 {
-		return []int{0, len(points)}
-	}
-	totalDist := points[len(points)-1].S
-	if totalDist <= 0 {
-		return []int{0, len(points)}
-	}
-	lapLen := totalDist / float64(laps)
-	target := lapLen
-	out := []int{0}
-	for i, p := range points {
-		if p.S >= target && len(out) < laps {
-			out = append(out, i)
-			target += lapLen
-		}
-	}
-	// Ensure final endpoint (end-exclusive) is included.
-	if out[len(out)-1] != len(points) {
-		out = append(out, len(points))
-	}
-	return out
-}
-
-func deriveLapCount(totalDist float64, preferred int) int {
-	if preferred > 0 {
-		return preferred
-	}
-	if totalDist <= 0 {
-		return 1
-	}
-	laps := int(math.Round(totalDist / 50000.0))
-	if laps < 1 {
-		laps = 1
-	}
-	if laps > 8 {
-		laps = 8
-	}
-	return laps
-}
-
-func buildLapIdx(trackPoints []models.Trackpoint, laps int, lapLen float64, lapTol float64, minLapSpacing float64) []int {
-	if lapLen > 0 && laps <= 1 {
-		idx := track.FindLapIndicesByDistanceWithMin(trackPoints, lapLen, lapTol, math.Max(minLapSpacing, lapLen*0.2))
-		if len(idx) >= 2 {
-			return idx
-		}
-	}
-	return buildEvenLapIdx(trackPoints, laps)
 }
 
 type multiFlag []string
