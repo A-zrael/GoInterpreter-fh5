@@ -35,12 +35,8 @@ func main() {
 		inputFiles = append(inputFiles, filesFromFolders(folderPaths)...)
 	}
 	if len(inputFiles) == 0 {
-		if len(filePaths) == 0 && len(folderPaths) == 0 {
-			inputFiles = append(inputFiles, "mockdata/gol1/Car-5030.csv")
-		} else {
-			fmt.Fprintf(os.Stderr, "no CSV files found for provided -file/-folder args\n")
-			os.Exit(1)
-		}
+		fmt.Fprintf(os.Stderr, "no CSV files found; provide -file and/or -folder\n")
+		os.Exit(1)
 	}
 	fmt.Fprintf(os.Stderr, "input files: %d\n", len(inputFiles))
 
