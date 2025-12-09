@@ -1,5 +1,6 @@
 # 🏁 Forza Telemetry Playground
 > Turn raw FH5 / Forza Motorsport CSV exports into a cinematic lap explorer with zero setup.
+> Built to pair with the capture flow from [Forza-Horizon-5-Recorder](https://github.com/A-zrael/Forza-Horizon-5-Recorder).
 
 ## Why this is fun
 - ⚡️ Drop in one or many CSVs; laps, sectors, and race type are auto-detected.
