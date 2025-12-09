@@ -3,17 +3,20 @@ package track
 import "forza/models"
 
 // MapToMaster emits per-point mapping from a lap segment to the master lap.
-// For each point in 'lap', it finds the nearest master point by S progression.
+// scaleS lets the caller stretch/shrink lap S to match master length.
 // The provided callback receives (point index within the full session, lap-local
-// relS, point coords, master index, master relS, master coords, distance).
-func MapToMaster(lap []models.Trackpoint, master []models.Trackpoint, startIndex int, emit func(idx int, relS, x, y float64, mi int, mRelS, mx, my, dist float64)) {
+// relS (scaled), point coords, master index, master relS, master coords, distance).
+func MapToMaster(lap []models.Trackpoint, master []models.Trackpoint, startIndex int, scaleS float64, emit func(idx int, relS, x, y float64, mi int, mRelS, mx, my, dist float64)) {
 	if len(lap) == 0 || len(master) == 0 || emit == nil {
 		return
+	}
+	if scaleS == 0 {
+		scaleS = 1
 	}
 
 	j := 0
 	for i := 0; i < len(lap); i++ {
-		relS := lap[i].S - lap[0].S
+		relS := (lap[i].S - lap[0].S) * scaleS
 		for j+1 < len(master) && master[j+1].S <= relS {
 			j++
 		}

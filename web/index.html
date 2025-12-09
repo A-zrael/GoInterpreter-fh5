@@ -87,6 +87,13 @@
     #controls { display: flex; align-items: center; gap: 8px; margin: 6px 0 10px; }
     #controls button { background: var(--accent); color: #000; border: none; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
     #controls input[type=range] { flex: 1; }
+    #controls select {
+      background: #1b1f2c;
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 6px;
+      padding: 4px 6px;
+    }
     #timeLabel { font-family: monospace; color: var(--muted); }
     .table-wrap { overflow-x: auto; }
     #settingsBtn {
@@ -185,11 +192,134 @@
       top: 0; left: 0; bottom: 0;
       width: 0%;
     }
+    .wheel-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 4px;
+      margin-top: 6px;
+    }
+    .wheel-cell {
+      padding: 6px;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+      font-size: 11px;
+      text-align: center;
+    }
+    .wheel-title { font-size: 12px; color: var(--muted); margin-top: 8px; }
     .speed-label {
       display: block;
       font-size: 11px;
       color: var(--muted);
       margin-top: 2px;
+    }
+    #toastContainer {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 30;
+      pointer-events: none;
+    }
+    .toast {
+      min-width: 220px;
+      max-width: 320px;
+      background: rgba(17,20,29,0.95);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 10px 12px;
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: 0 10px 24px rgba(0,0,0,0.45);
+      pointer-events: auto;
+      animation: fadeIn 150ms ease;
+    }
+    .toast-type { font-weight: 700; letter-spacing: 0.5px; text-transform: uppercase; font-size: 11px; color: var(--accent); }
+    .toast-note { margin: 4px 0; font-size: 12px; }
+    .toast-meta { font-size: 11px; color: var(--muted); }
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(-6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .live-toggle {
+      padding: 6px 10px 4px;
+      font-size: 12px;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .latch-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      cursor: pointer;
+      transition: background 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+      user-select: none;
+      position: relative;
+      line-height: 1.2;
+    }
+    .latch-btn input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+      width: 0;
+      height: 0;
+      margin: 0;
+      padding: 0;
+      appearance: none;
+    }
+    .latch-btn .pill-dot {
+      width: 14px;
+      height: 14px;
+      min-width: 14px;
+      min-height: 14px;
+      border-radius: 50%;
+      border: 1px solid rgba(255,255,255,0.25);
+      background: rgba(255,255,255,0.08);
+      box-shadow: inset 0 0 0 2px rgba(0,0,0,0.4);
+      flex: 0 0 14px;
+      display: inline-block;
+      box-sizing: border-box;
+      aspect-ratio: 1 / 1;
+    }
+    .latch-btn .pill-label {
+      font-weight: 500;
+      line-height: 14px;
+      padding-left: 6px;
+      padding-top: 0;
+    }
+    .latch-btn.active {
+      border-color: rgba(255,177,0,0.65);
+      background: linear-gradient(135deg, rgba(255,177,0,0.25), rgba(255,255,255,0.05));
+      box-shadow: 0 0 0 2px rgba(255,177,0,0.18);
+    }
+    .latch-btn.active .pill-dot {
+      background: var(--accent);
+      border-color: rgba(0,0,0,0.3);
+    }
+    .latch-btn.block {
+      display: flex;
+      width: 100%;
+      justify-content: flex-start;
+      margin: 4px 0;
+    }
+    .settings-events { margin-top: 8px; }
+    .settings-events h4 { margin: 6px 0 4px; font-size: 13px; }
+    .settings-events .ev-option {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 8px;
+      margin: 3px 4px 3px 0;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.1);
+      background: rgba(255,255,255,0.04);
+      font-size: 12px;
+      cursor: pointer;
     }
     @media (max-width: 900px) {
       body {
@@ -227,6 +357,7 @@
   </style>
 </head>
 <body>
+  <div id="toastContainer"></div>
   <button id="settingsBtn">Setup</button>
   <div id="settingsOverlay">
     <div id="settingsModal">
@@ -235,11 +366,23 @@
         <label><input type="radio" name="unit" value="mph" checked /> MPH</label>
         <label><input type="radio" name="unit" value="kmh" /> KM/H</label>
       </div>
-      <div style="margin-top:8px;">
-        <label><input type="checkbox" id="showControlsAll" /> Always show throttle/brake</label>
+      <div style="margin-top:8px; display:flex; flex-direction:column; gap:6px;">
+        <label class="latch-btn block" for="showEvents">
+          <input type="checkbox" id="showEvents" />
+          <span class="pill-dot"></span>
+          <span class="pill-label">Draw events on map</span>
+        </label>
+        <label class="latch-btn block" for="showLabels">
+          <input type="checkbox" id="showLabels" />
+          <span class="pill-dot"></span>
+          <span class="pill-label">Show car labels on map</span>
+        </label>
       </div>
+      <div id="settingsEventTypes" class="settings-events"></div>
       <div style="margin-top:8px;">
-        <label><input type="checkbox" id="showEvents" /> Draw events on map</label>
+        <label>Temperature units:</label>
+        <label><input type="radio" name="tempUnit" value="c" checked /> Celsius</label>
+        <label><input type="radio" name="tempUnit" value="f" /> Fahrenheit</label>
       </div>
       <div class="actions">
         <button id="settingsClose">Close</button>
@@ -249,13 +392,31 @@
   <canvas id="canvas"></canvas>
   <div id="livePanel">
     <div id="liveHeader">Live Telemetry</div>
+    <div id="liveToggles" class="live-toggle">
+      <label class="latch-btn" id="advancedLatch">
+        <input type="checkbox" id="liveShowControls" />
+        <span class="pill-dot"></span>
+        <span class="pill-label">Advanced</span>
+      </label>
+    </div>
     <div id="live"></div>
   </div>
   <div id="sidebar">
     <h1>Forza Lap Viewer</h1>
     <div id="controls">
+      <button id="jumpBack" title="Jump back 5s">-5s</button>
       <button id="playPause">Play</button>
+      <button id="jumpFwd" title="Jump forward 5s">+5s</button>
       <input type="range" id="scrub" min="0" max="1" step="0.01" value="0" />
+      <select id="playbackRate" title="Playback speed">
+        <option value="0.25">0.25x</option>
+        <option value="0.5">0.5x</option>
+        <option value="0.75">0.75x</option>
+        <option value="1" selected>1x</option>
+        <option value="1.5">1.5x</option>
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+      </select>
       <span id="timeLabel">0:00.000</span>
     </div>
     <div id="status">Loading data…</div>

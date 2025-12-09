@@ -3,6 +3,9 @@
   const ctx = canvas.getContext("2d");
   const statusEl = document.getElementById("status");
   const playBtn = document.getElementById("playPause");
+  const jumpBackBtn = document.getElementById("jumpBack");
+  const jumpFwdBtn = document.getElementById("jumpFwd");
+  const playbackRateSelect = document.getElementById("playbackRate");
   const scrub = document.getElementById("scrub");
   const timeLabel = document.getElementById("timeLabel");
   const legendEl = document.getElementById("legend");
@@ -17,12 +20,18 @@
   const steerInfo = document.getElementById("steerInfo");
   const liveEl = document.getElementById("live");
   const livePanel = document.getElementById("livePanel");
+  const liveShowControls = document.getElementById("liveShowControls");
+  const advancedLatch = document.getElementById("advancedLatch");
   const settingsBtn = document.getElementById("settingsBtn");
   const settingsOverlay = document.getElementById("settingsOverlay");
   const settingsClose = document.getElementById("settingsClose");
-  const showControlsAll = document.getElementById("showControlsAll");
   const showEventsToggle = document.getElementById("showEvents");
+  const showEventsLatch = document.querySelector('label[for="showEvents"]');
+  const showLabelsToggle = document.getElementById("showLabels");
+  const showLabelsLatch = document.querySelector('label[for="showLabels"]');
+  const settingsEventTypes = document.getElementById("settingsEventTypes");
   const eventFilterEl = document.getElementById("eventFilter");
+  const toastContainer = document.getElementById("toastContainer");
   const staticCanvas = document.createElement("canvas");
   const staticCtx = staticCanvas.getContext("2d");
 
@@ -31,6 +40,7 @@
   let lastTs = 0;
   let currentTime = 0;
   let maxTime = 0;
+  let playbackRate = 1;
   let unit = "mph";
   let boundsCache = null;
   let lastHudUpdate = 0;
@@ -40,7 +50,20 @@
   let selectedCar = null; // null = show all
   let showControls = false;
   let showEvents = false;
-  let eventTypes = new Set(["crash", "collision", "reset", "surface", "overtake"]);
+  let showLabels = false;
+  let eventTypes = new Set();
+  let notifyTypes = new Set();
+  let eventTypeOrder = [];
+  let sortedEvents = [];
+  const majorEvents = new Set(["crash", "collision", "reset", "drift", "traction", "overtake", "position_gain", "position_loss", "pole_gain", "pole_loss"]);
+  let debugEl = null;
+  let debugEnabled = true;
+  const telemetryRanges = {
+    susp: { min: Infinity, max: -Infinity },
+    // temps stored in °C from the backend; midLow/midHigh adjusted per unit in computeTelemetryRanges
+    temp: { min: Infinity, max: -Infinity, midLow: 88, midHigh: 99 },
+  };
+  let tempUnit = "c"; // c or f
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -77,13 +100,27 @@
         maxTime = computeMaxTime();
         scrub.max = maxTime || 1;
         statusEl.textContent = `Loaded master (${data.master.length} pts), ${data.cars?.length || 0} cars, ${data.events?.length || 0} events`;
+        // Build dynamic event type list
+        const types = new Set();
+        (data.events || []).forEach((ev) => {
+          const t = (ev.type || "").toLowerCase();
+          if (t) types.add(t);
+        });
+        eventTypeOrder = Array.from(types).sort();
+        eventTypes = new Set(eventTypeOrder);
+        notifyTypes = new Set(eventTypeOrder);
+        sortedEvents = (data.events || []).slice().filter((e) => isFinite(e.time)).sort((a, b) => a.time - b.time);
+        computeTelemetryRanges();
         buildDeltaPlayer();
         buildLegend();
+        buildSettingsEventTypes();
         buildLaps();
         buildEvents();
         updateLive();
         initDrag();
         initSettings();
+        initLiveToggles();
+        initDebug();
         renderStatic();
         carCursors = new Array(data.cars?.length || 0).fill(0);
         resize();
@@ -155,22 +192,100 @@
       });
       if (r.checked) unit = r.value;
     });
-    if (showControlsAll) {
-      showControlsAll.checked = showControls;
-      showControlsAll.addEventListener("change", (e) => {
-        showControls = e.target.checked;
-        updateLive();
-      });
-    }
     if (showEventsToggle) {
       showEventsToggle.checked = showEvents;
+      if (showEventsLatch) showEventsLatch.classList.toggle("active", showEvents);
       showEventsToggle.addEventListener("change", (e) => {
         showEvents = e.target.checked;
+        if (showEventsLatch) showEventsLatch.classList.toggle("active", showEvents);
         buildEventFilter();
         renderStatic();
         draw();
       });
     }
+    if (showLabelsToggle) {
+      showLabelsToggle.checked = showLabels;
+      if (showLabelsLatch) showLabelsLatch.classList.toggle("active", showLabels);
+      showLabelsToggle.addEventListener("change", (e) => {
+        showLabels = e.target.checked;
+        if (showLabelsLatch) showLabelsLatch.classList.toggle("active", showLabels);
+        renderStatic();
+        draw();
+      });
+    }
+    const tempRadios = settingsOverlay.querySelectorAll("input[name=tempUnit]");
+    tempRadios.forEach((r) => {
+      r.addEventListener("change", (e) => {
+        tempUnit = e.target.value;
+        computeTelemetryRanges();
+        updateLive();
+      });
+      if (r.checked) tempUnit = r.value;
+    });
+  }
+
+  function initLiveToggles() {
+    if (!liveShowControls) return;
+    liveShowControls.checked = showControls;
+    if (advancedLatch) {
+      advancedLatch.classList.toggle("active", showControls);
+    }
+    liveShowControls.addEventListener("change", (e) => {
+      showControls = e.target.checked;
+      if (advancedLatch) {
+        advancedLatch.classList.toggle("active", showControls);
+      }
+      updateLive();
+    });
+  }
+
+  function initDebug() {
+    if (!canvas) return;
+    if (!debugEl) {
+      debugEl = document.createElement("div");
+      debugEl.style.position = "fixed";
+      debugEl.style.background = "rgba(0,0,0,0.7)";
+      debugEl.style.color = "#fff";
+      debugEl.style.padding = "4px 8px";
+      debugEl.style.borderRadius = "4px";
+      debugEl.style.fontSize = "12px";
+      debugEl.style.pointerEvents = "none";
+      debugEl.style.zIndex = 1000;
+      debugEl.style.display = "none";
+      document.body.appendChild(debugEl);
+    }
+    const onMove = (e) => {
+      if (!debugEnabled) return;
+      if (!data || !data.heatmap || data.heatmap.length === 0) return;
+      const rect = canvas.getBoundingClientRect();
+      const mx = (e.clientX - rect.left) * (canvas.width / (rect.width || 1));
+      const my = (e.clientY - rect.top) * (canvas.height / (rect.height || 1));
+      const bounds = boundsCache || getBounds();
+      let best = null;
+      for (let i = 0; i < data.heatmap.length; i++) {
+        const pt = data.heatmap[i];
+        const { x, y } = project(pt, bounds, canvas.width, canvas.height);
+        const dx = x - mx;
+        const dy = y - my;
+        const d2 = dx * dx + dy * dy;
+        if (!best || d2 < best.d2) {
+          best = { idx: i, pt, d2 };
+        }
+      }
+      if (!best) return;
+      debugEl.style.display = "block";
+      debugEl.textContent = `Heat idx ${best.idx} accel ${Number(best.pt.avgAccel).toFixed(3)} x ${Number(best.pt.x).toFixed(1)} y ${Number(best.pt.y).toFixed(1)}`;
+      debugEl.style.left = `${e.clientX + 12}px`;
+      debugEl.style.top = `${e.clientY + 12}px`;
+    };
+    const onLeave = () => {
+      if (debugEl) debugEl.style.display = "none";
+    };
+    canvas.addEventListener("pointermove", onMove);
+    canvas.addEventListener("pointerleave", onLeave);
+    // Fallback for browsers without pointer events.
+    canvas.addEventListener("mousemove", onMove);
+    canvas.addEventListener("mouseleave", onLeave);
   }
 
   function orient(pt) {
@@ -239,6 +354,18 @@
         ctx.beginPath();
         ctx.arc(x, y, 5, 0, Math.PI * 2);
         ctx.fill();
+        if (showLabels) {
+          // Label with car name; omit event on map labels.
+          const label = car.source || `Car ${globalIdx + 1}`;
+          const text = label;
+          ctx.font = "12px 'Segoe UI', system-ui, sans-serif";
+          ctx.textBaseline = "middle";
+          ctx.fillStyle = "#fff";
+          ctx.strokeStyle = "rgba(0,0,0,0.6)";
+          ctx.lineWidth = 3;
+          ctx.strokeText(text, x + 8, y);
+          ctx.fillText(text, x + 8, y);
+        }
       }
     });
 
@@ -254,6 +381,29 @@
     staticCanvas.height = h;
     staticCtx.clearRect(0, 0, w, h);
     const bounds = boundsCache;
+    // Start/finish marker (simple line)
+    if (data.master && data.master.length > 1) {
+      const start = data.master[0];
+      const next = data.master[1];
+      const { x: sx, y: sy } = project(start, bounds, w, h);
+      const { x: ex, y: ey } = project(next, bounds, w, h);
+      const dx = ex - sx;
+      const dy = ey - sy;
+      const len = Math.hypot(dx, dy) || 1;
+      const ux = dx / len;
+      const uy = dy / len;
+      const extend = len * 12; // extend line to make it visible across wider tracks
+      const sx2 = sx - ux * extend;
+      const sy2 = sy - uy * extend;
+      const ex2 = ex + ux * extend;
+      const ey2 = ey + uy * extend;
+      staticCtx.strokeStyle = "#aaa";
+      staticCtx.lineWidth = 8;
+      staticCtx.beginPath();
+      staticCtx.moveTo(sx2, sy2);
+      staticCtx.lineTo(ex2, ey2);
+      staticCtx.stroke();
+    }
     // Heatmap
     if (data.heatmap && data.heatmap.length > 1) {
       const accels = data.heatmap.map((p) => p.avgAccel).filter((v) => isFinite(v));
@@ -328,6 +478,44 @@
     return `rgb(${r},${g},${b})`;
   }
 
+  function rampColor(val, range) {
+    if (!range || !isFinite(val) || !isFinite(range.min) || !isFinite(range.max) || range.max === range.min) {
+      return "";
+    }
+    const midLow = isFinite(range.midLow) ? range.midLow : (range.min + range.max) / 2;
+    const midHigh = isFinite(range.midHigh) ? range.midHigh : midLow;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const lerpColor = (c1, c2, t) => {
+      const r = Math.round(c1.r + (c2.r - c1.r) * t);
+      const g = Math.round(c1.g + (c2.g - c1.g) * t);
+      const b = Math.round(c1.b + (c2.b - c1.b) * t);
+      return `rgb(${r},${g},${b})`;
+    };
+    const red = { r: 255, g: 107, b: 107 };
+    const amber = { r: 255, g: 177, b: 0 };
+    const green = { r: 93, g: 211, b: 158 };
+
+    let t = 0;
+    if (val < midLow) {
+      const span = midLow - range.min;
+      t = span > 0 ? -1 + clamp((val - range.min) / span, 0, 1) : -1;
+    } else if (val > midHigh) {
+      const span = range.max - midHigh;
+      t = span > 0 ? clamp((val - midHigh) / span, 0, 1) : 1;
+    } else {
+      t = 0;
+    }
+    t = clamp(t, -1, 1);
+    const u = Math.abs(t);
+    if (u >= 0.5) {
+      const blend = (u - 0.5) / 0.5; // 0.5->1 maps amber->red
+      return lerpColor(amber, red, blend);
+    }
+    // 0->0.5 maps green->amber
+    const blend = u / 0.5;
+    return lerpColor(green, amber, blend);
+  }
+
   function positionAtTime(points, t) {
     if (!points || points.length === 0) return null;
     if (t <= points[0].time) return { ...points[0] };
@@ -357,6 +545,17 @@
       throttle: p1.throttle + (p2.throttle - p1.throttle) * alpha,
       brake: p1.brake + (p2.brake - p1.brake) * alpha,
       steerDeg: p1.steerDeg + (p2.steerDeg - p1.steerDeg) * alpha,
+      throttleInput: p1.throttleInput + (p2.throttleInput - p1.throttleInput) * alpha,
+      brakeInput: p1.brakeInput + (p2.brakeInput - p1.brakeInput) * alpha,
+      steerInput: p1.steerInput + (p2.steerInput - p1.steerInput) * alpha,
+      suspFL: p1.suspFL + (p2.suspFL - p1.suspFL) * alpha,
+      suspFR: p1.suspFR + (p2.suspFR - p1.suspFR) * alpha,
+      suspRL: p1.suspRL + (p2.suspRL - p1.suspRL) * alpha,
+      suspRR: p1.suspRR + (p2.suspRR - p1.suspRR) * alpha,
+      tireTempFL: p1.tireTempFL + (p2.tireTempFL - p1.tireTempFL) * alpha,
+      tireTempFR: p1.tireTempFR + (p2.tireTempFR - p1.tireTempFR) * alpha,
+      tireTempRL: p1.tireTempRL + (p2.tireTempRL - p1.tireTempRL) * alpha,
+      tireTempRR: p1.tireTempRR + (p2.tireTempRR - p1.tireTempRR) * alpha,
     };
   }
 
@@ -385,7 +584,7 @@
   function buildEventFilter() {
     if (!eventFilterEl) return;
     eventFilterEl.innerHTML = "";
-    const types = ["crash", "collision", "reset", "surface", "overtake"];
+    const types = eventTypeOrder.length ? eventTypeOrder : Array.from(eventTypes);
     types.forEach((t) => {
       const id = `ev-${t}`;
       const label = document.createElement("label");
@@ -399,12 +598,72 @@
         buildEvents();
         renderStatic();
         draw();
+        buildSettingsEventTypes();
+        rebuildNotificationTypes();
       });
       label.appendChild(cb);
       label.appendChild(document.createTextNode(` ${t}`));
       eventFilterEl.appendChild(label);
     });
     eventFilterEl.style.display = showEvents ? "flex" : "none";
+  }
+
+  function buildSettingsEventTypes() {
+    if (!settingsEventTypes) return;
+    settingsEventTypes.innerHTML = "";
+    const wrapTitle = document.createElement("h4");
+    wrapTitle.textContent = "Event types";
+    settingsEventTypes.appendChild(wrapTitle);
+    const types = eventTypeOrder.length ? eventTypeOrder : Array.from(eventTypes);
+    types.forEach((t) => {
+      const col = eventColor(t);
+      const tint = col || "#cdd7e1";
+      const lbl = document.createElement("label");
+      lbl.className = "latch-btn block";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = eventTypes.has(t);
+      lbl.classList.toggle("active", cb.checked);
+      if (cb.checked) {
+        lbl.style.borderColor = `${tint}88`;
+        lbl.style.boxShadow = `0 0 0 2px ${tint}33`;
+        lbl.style.background = `linear-gradient(135deg, ${tint}26, ${tint}12)`;
+      }
+      cb.addEventListener("change", (e) => {
+        if (e.target.checked) eventTypes.add(t); else eventTypes.delete(t);
+        lbl.classList.toggle("active", e.target.checked);
+        if (e.target.checked) {
+          lbl.style.borderColor = `${tint}88`;
+          lbl.style.boxShadow = `0 0 0 2px ${tint}33`;
+          lbl.style.background = `linear-gradient(135deg, ${tint}26, ${tint}12)`;
+        } else {
+          lbl.style.borderColor = "";
+          lbl.style.boxShadow = "";
+          lbl.style.background = "";
+        }
+        buildEvents();
+        renderStatic();
+        draw();
+        buildEventFilter();
+        rebuildNotificationTypes();
+      });
+      const dot = document.createElement("span");
+      dot.className = "pill-dot";
+      dot.style.background = tint;
+      dot.style.borderColor = `${tint}aa`;
+      const text = document.createElement("span");
+      text.className = "pill-label";
+      text.textContent = t;
+      text.style.color = tint;
+      lbl.appendChild(cb);
+      lbl.appendChild(dot);
+      lbl.appendChild(text);
+      settingsEventTypes.appendChild(lbl);
+    });
+  }
+
+  function rebuildNotificationTypes() {
+    notifyTypes = new Set(eventTypes);
   }
 
   function ms(x) { return (x * 1000).toFixed(0); }
@@ -415,6 +674,58 @@
     const mm = Math.floor(s / 60);
     const ss = s % 60;
     return `${mm}:${ss.toString().padStart(2, "0")}.${msPart.toString().padStart(3, "0")}`;
+  }
+
+  function notifyEvent(ev) {
+    const ttype = (ev.type || "").toLowerCase();
+    if (!toastContainer || !ev || !majorEvents.has(ttype) || (notifyTypes.size && !notifyTypes.has(ttype))) return;
+    const el = document.createElement("div");
+    el.className = "toast";
+    const type = (ev.type || "event").replace(/_/g, " ").toUpperCase();
+    const note = ev.note || "";
+    const src = (ev.source || ev.target || "").split("/").pop();
+    const lap = ev.lap ?? "?";
+    const t = isFinite(ev.time) ? ev.time.toFixed(2) : "?";
+    el.innerHTML = `
+      <div class="toast-type">${src ? `${src}: ${type}` : type}</div>
+      <div class="toast-note">${note}</div>
+      <div class="toast-meta">t=${t}s · lap ${lap}</div>
+    `;
+    el.addEventListener("click", () => el.remove());
+    toastContainer.appendChild(el);
+    setTimeout(() => el.remove(), 4200);
+  }
+
+  function checkNotifications(prev, now) {
+    if (!sortedEvents || sortedEvents.length === 0) return;
+    if (!isFinite(prev) || !isFinite(now) || now <= prev) return;
+    for (let i = 0; i < sortedEvents.length; i++) {
+      const ev = sortedEvents[i];
+      if (!isFinite(ev.time)) continue;
+      if (ev.time > prev && ev.time <= now && majorEvents.has((ev.type || "").toLowerCase())) {
+        notifyEvent(ev);
+      }
+      if (ev.time > now) break;
+    }
+  }
+
+  function latestMajorEventLabel(car, t) {
+    if (!car || !car.source || !sortedEvents || !sortedEvents.length) return "";
+    const src = car.source;
+    let best = null;
+    for (let i = sortedEvents.length - 1; i >= 0; i--) {
+      const ev = sortedEvents[i];
+      if (!isFinite(ev.time) || ev.time > t) continue;
+      if (ev.source !== src) continue;
+      const type = (ev.type || "").toLowerCase();
+      if (!majorEvents.has(type)) continue;
+      best = ev;
+      break;
+    }
+    if (!best) return "";
+    // Only show if fairly recent (e.g., within 5s)
+    if (isFinite(best.time) && t - best.time > 5) return "";
+    return best.type;
   }
 
   function buildLaps() {
@@ -499,6 +810,10 @@
       case "reset": return "#5dd39e";
       case "surface": return "#6bc5ff";
       case "overtake": return "#f78bff";
+      case "position_gain": return "#5dd39e";
+      case "position_loss": return "#ff6b6b";
+      case "pole_gain": return "#00c2ff";
+      case "pole_loss": return "#ff6b6b";
       default: return "#cdd7e1";
     }
   }
@@ -549,9 +864,13 @@
   }
 
   function updateTime(t) {
+    const prev = currentTime;
     currentTime = Math.min(Math.max(0, t), maxTime || 0);
     scrub.value = currentTime;
     timeLabel.textContent = fmt(currentTime);
+    if (playing && currentTime > prev) {
+      checkNotifications(prev, currentTime);
+    }
     updateHUD(true);
     draw();
   }
@@ -569,6 +888,26 @@
     updateTime(parseFloat(e.target.value));
   });
 
+  if (jumpBackBtn) {
+    jumpBackBtn.addEventListener("click", () => {
+      updateTime(currentTime - 5);
+    });
+  }
+  if (jumpFwdBtn) {
+    jumpFwdBtn.addEventListener("click", () => {
+      updateTime(currentTime + 5);
+    });
+  }
+
+  if (playbackRateSelect) {
+    const v = parseFloat(playbackRateSelect.value);
+    playbackRate = isFinite(v) && v > 0 ? v : 1;
+    playbackRateSelect.addEventListener("change", (e) => {
+      const v = parseFloat(e.target.value);
+      playbackRate = isFinite(v) && v > 0 ? v : 1;
+    });
+  }
+
   function tick(ts) {
     if (!playing) return;
     const elapsed = ts - lastTs;
@@ -577,7 +916,7 @@
       return;
     }
     lastTs = ts;
-    const dt = elapsed / 1000;
+    const dt = (elapsed / 1000) * playbackRate;
     updateTime(currentTime + dt);
     if (currentTime >= maxTime) {
       playing = false;
@@ -815,6 +1154,12 @@
       const latG = head && isFinite(head.latAcc) ? head.latAcc / 9.81 : null;
       const longG = head && isFinite(head.longAcc) ? head.longAcc / 9.81 : null;
       const yaw = head && isFinite(head.yawRate) ? head.yawRate * (180 / Math.PI) : null;
+      const susp = head ? [head.suspFL, head.suspFR, head.suspRL, head.suspRR] : [];
+      const tempsRaw = head ? [head.tireTempFL, head.tireTempFR, head.tireTempRL, head.tireTempRR] : [];
+      const temps = tempsRaw.map((v) => {
+        if (!isFinite(v)) return v;
+        return tempUnit === "f" ? v * 9/5 + 32 : v; // assume source is C; leave as-is for C
+      });
       const row = document.createElement("div");
       row.className = "live-row";
       const name = document.createElement("span");
@@ -839,8 +1184,8 @@
       liveEl.appendChild(label);
 
       // Controls / dynamics meters
-      const shouldShowControls = showControls || selectedCar !== null;
-      if (shouldShowControls) {
+      const shouldShowAdvanced = showControls || selectedCar !== null;
+      if (shouldShowAdvanced) {
         liveEl.appendChild(makeMeter("Throttle", throttle, "#5dd39e"));
         liveEl.appendChild(makeMeter("Brake", brake, "#ff6b6b"));
       }
@@ -854,6 +1199,16 @@
       dynamics.appendChild(dynLabel);
       dynamics.appendChild(dynVals);
       liveEl.appendChild(dynamics);
+
+      // Suspension grid
+      if (shouldShowAdvanced && susp.length === 4) {
+        liveEl.appendChild(makeWheelGrid("Suspension (m)", susp, (v) => v !== undefined ? v.toFixed(3) : "--", telemetryRanges.susp));
+      }
+      // Tire temp grid
+      if (shouldShowAdvanced && temps.length === 4) {
+        const labelUnit = tempUnit === "f" ? "°F" : "°C";
+        liveEl.appendChild(makeWheelGrid(`Tire Temp (${labelUnit})`, temps, (v) => v !== undefined ? v.toFixed(1) : "--", telemetryRanges.temp));
+      }
     });
   }
 
@@ -892,5 +1247,76 @@
     speeds.sort((a, b) => a - b);
     const idx = Math.floor(speeds.length * 0.95);
     return Math.max(unit === "kmh" ? 100 : 60, Math.round(speeds[idx]));
+  }
+
+  function makeWheelGrid(title, vals, fmtFn, range) {
+    const wrap = document.createElement("div");
+    const heading = document.createElement("div");
+    heading.className = "wheel-title";
+    heading.textContent = title;
+    wrap.appendChild(heading);
+    const grid = document.createElement("div");
+    grid.className = "wheel-grid";
+    const labels = ["FL", "FR", "RL", "RR"];
+    for (let i = 0; i < 4; i++) {
+      const cell = document.createElement("div");
+      cell.className = "wheel-cell";
+      const val = vals[i];
+      const txt = `${labels[i]} ${val !== undefined && isFinite(val) ? fmtFn(val) : "--"}`;
+      cell.textContent = txt;
+      if (val !== undefined && isFinite(val)) {
+        const color = rampColor(val, range);
+        if (color) {
+          cell.style.background = color;
+          cell.style.color = "#000";
+        }
+      }
+      grid.appendChild(cell);
+    }
+    wrap.appendChild(grid);
+    return wrap;
+  }
+
+  function computeTelemetryRanges() {
+    telemetryRanges.susp.min = telemetryRanges.temp.min = Infinity;
+    telemetryRanges.susp.max = telemetryRanges.temp.max = -Infinity;
+    // Ideal slick temps in current unit.
+    const idealLowC = 88, idealHighC = 99;
+    const idealLow = tempUnit === "f" ? idealLowC * 9/5 + 32 : idealLowC;
+    const idealHigh = tempUnit === "f" ? idealHighC * 9/5 + 32 : idealHighC;
+    const pad = tempUnit === "f" ? 36 : 20; // ~20°C or 36°F padding outside ideal window
+    telemetryRanges.temp.midLow = idealLow;
+    telemetryRanges.temp.midHigh = idealHigh;
+    (data.cars || []).forEach((car) => {
+      (car.points || []).forEach((p) => {
+        ["suspFL", "suspFR", "suspRL", "suspRR"].forEach((k) => {
+          const v = p[k];
+          if (isFinite(v)) {
+            telemetryRanges.susp.min = Math.min(telemetryRanges.susp.min, v);
+            telemetryRanges.susp.max = Math.max(telemetryRanges.susp.max, v);
+          }
+        });
+        ["tireTempFL", "tireTempFR", "tireTempRL", "tireTempRR"].forEach((k) => {
+          let v = p[k];
+          if (isFinite(v) && tempUnit === "f") {
+            v = v * 9/5 + 32;
+          }
+          if (isFinite(v)) {
+            telemetryRanges.temp.min = Math.min(telemetryRanges.temp.min, v);
+            telemetryRanges.temp.max = Math.max(telemetryRanges.temp.max, v);
+          }
+        });
+      });
+    });
+    if (!isFinite(telemetryRanges.susp.min) || !isFinite(telemetryRanges.susp.max)) {
+      telemetryRanges.susp.min = 0; telemetryRanges.susp.max = 1;
+    }
+    if (!isFinite(telemetryRanges.temp.min) || !isFinite(telemetryRanges.temp.max)) {
+      telemetryRanges.temp.min = idealLow - pad;
+      telemetryRanges.temp.max = idealHigh + pad;
+    }
+    // Ensure temp range covers ideal slick window.
+    telemetryRanges.temp.min = Math.min(telemetryRanges.temp.min, telemetryRanges.temp.midLow - pad);
+    telemetryRanges.temp.max = Math.max(telemetryRanges.temp.max, telemetryRanges.temp.midHigh + pad);
   }
 })();

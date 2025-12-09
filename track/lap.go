@@ -3,6 +3,7 @@ package track
 import (
 	"forza/models"
 	"math"
+	"sort"
 )
 
 // BuildEvenLapIdx generates lap boundaries assuming 'laps' equally spaced laps by distance.
@@ -49,7 +50,58 @@ func DeriveLapCount(totalDist float64, preferred int) int {
 }
 
 // BuildLapIdx attempts distance-based detection when lapLen is provided, otherwise falls back to even spacing.
-func BuildLapIdx(trackPoints []models.Trackpoint, laps int, lapLen float64, lapTol float64, minLapSpacing float64) []int {
+// If enforceLapCount is true, detected laps will be capped to the requested count.
+func BuildLapIdx(trackPoints []models.Trackpoint, laps int, lapLen float64, lapTol float64, minLapSpacing float64, enforceLapCount bool, radius float64) []int {
+	if radius <= 0 {
+		radius = 10
+	}
+
+	// Prefer positional detection now that absolute coordinates are available.
+	posIdx := DetectLapsNearStart(trackPoints, radius, minLapSpacing)
+	if len(posIdx) >= 2 {
+		// Prune obviously spurious laps that are much shorter than the median.
+		if len(posIdx) > 2 {
+			lens := make([]float64, 0, len(posIdx)-1)
+			for i := 1; i < len(posIdx); i++ {
+				start := posIdx[i-1]
+				end := posIdx[i]
+				if end > len(trackPoints) {
+					end = len(trackPoints)
+				}
+				if end <= start {
+					continue
+				}
+				lens = append(lens, trackPoints[end-1].S-trackPoints[start].S)
+			}
+			if len(lens) > 0 {
+				med := median(lens)
+				var filtered []int
+				filtered = append(filtered, posIdx[0])
+				for i := 1; i < len(posIdx)-1; i++ {
+					start := posIdx[i-1]
+					end := posIdx[i]
+					if end > len(trackPoints) {
+						end = len(trackPoints)
+					}
+					if end <= start {
+						continue
+					}
+					segLen := trackPoints[end-1].S - trackPoints[start].S
+					if segLen >= med*0.8 && segLen >= minLapSpacing {
+						filtered = append(filtered, posIdx[i])
+					}
+				}
+				filtered = append(filtered, posIdx[len(posIdx)-1])
+				posIdx = filtered
+			}
+		}
+		// If caller supplied an expected lap count, trim extras while keeping end boundary.
+		if enforceLapCount && laps > 0 && len(posIdx)-1 > laps {
+			posIdx = append(posIdx[:laps], len(trackPoints))
+		}
+		return posIdx
+	}
+
 	if lapLen > 0 && laps <= 1 {
 		idx := FindLapIndicesByDistanceWithMin(trackPoints, lapLen, lapTol, math.Max(minLapSpacing, lapLen*0.2))
 		if len(idx) >= 2 {
@@ -57,6 +109,19 @@ func BuildLapIdx(trackPoints []models.Trackpoint, laps int, lapLen float64, lapT
 		}
 	}
 	return BuildEvenLapIdx(trackPoints, laps)
+}
+
+func median(vals []float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	c := append([]float64(nil), vals...)
+	sort.Float64s(c)
+	mid := len(c) / 2
+	if len(c)%2 == 0 {
+		return (c[mid-1] + c[mid]) / 2
+	}
+	return c[mid]
 }
 
 // FindLapAndRelS returns the lap number (1-based) and relS within that lap for a point index.
@@ -69,4 +134,28 @@ func FindLapAndRelS(lapIdx []int, points []models.Trackpoint, idx int) (int, flo
 		}
 	}
 	return 0, 0
+}
+
+// IsLoopTrack returns true when the path comes back near the start (radius, min spacing).
+func IsLoopTrack(points []models.Trackpoint, radius float64, minLapDistance float64) bool {
+	if len(points) == 0 {
+		return false
+	}
+	if radius <= 0 {
+		radius = 10
+	}
+	idx := DetectLapsNearStart(points, radius, minLapDistance)
+	return len(idx) > 2
+}
+
+// IsLoopByProximity returns true if the path ends within radius of the start.
+func IsLoopByProximity(points []models.Trackpoint, radius float64) bool {
+	if len(points) < 2 {
+		return false
+	}
+	start := points[0]
+	end := points[len(points)-1]
+	dx := end.X - start.X
+	dy := end.Y - start.Y
+	return dx*dx+dy*dy <= radius*radius
 }

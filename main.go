@@ -70,6 +70,18 @@ type carPoint struct {
 	Throttle float64 `json:"throttle"`
 	Brake    float64 `json:"brake"`
 	SteerDeg float64 `json:"steerDeg"`
+	// Optional direct driver inputs from telemetry (normalized 0-1 or -1..1).
+	ThrottleInput float64 `json:"throttleInput,omitempty"`
+	BrakeInput    float64 `json:"brakeInput,omitempty"`
+	SteerInput    float64 `json:"steerInput,omitempty"`
+	SuspFL        float64 `json:"suspFL,omitempty"`
+	SuspFR        float64 `json:"suspFR,omitempty"`
+	SuspRL        float64 `json:"suspRL,omitempty"`
+	SuspRR        float64 `json:"suspRR,omitempty"`
+	TireTempFL    float64 `json:"tireTempFL,omitempty"`
+	TireTempFR    float64 `json:"tireTempFR,omitempty"`
+	TireTempRL    float64 `json:"tireTempRL,omitempty"`
+	TireTempRR    float64 `json:"tireTempRR,omitempty"`
 }
 
 type carOut struct {
@@ -86,9 +98,10 @@ func main() {
 	flag.Var(&folderPaths, "folder", "Folder containing telemetry CSV files (repeatable, recursive)")
 	lapLen := flag.Float64("lap-length", 0, "Expected lap length in meters (0 to autodetect by start crossing)")
 	lapTol := flag.Float64("lap-tol", 25, "Tolerance for lap length matching (meters)")
+	startFinishRadius := flag.Float64("start-finish-radius", 10, "Radius (m) to consider crossing start/finish for lap detection")
 	lapCount := flag.Int("lap-count", 0, "Known lap count; with lap-length=0, lap length is estimated as total distance / lap-count")
 	minLapSpacing := flag.Float64("min-lap-spacing", 200, "Minimum distance (m) between lap boundaries when using distance-based detection")
-	masterSamples := flag.Int("master-samples", 2000, "Resampled points per lap when building master lap")
+	masterSamples := flag.Int("master-samples", 4000, "Resampled points per lap when building master lap")
 	useMaster := flag.Bool("use-master", true, "If true, output the averaged master lap instead of per-lap raw points")
 	outPath := flag.String("out", "", "Write JSON to file instead of stdout; implied web/data.json when -serve is set")
 	sprintMode := flag.Bool("sprint", false, "Treat input as sprint (no lap crossing); if false, assume lapped race")
@@ -108,12 +121,13 @@ func main() {
 	fmt.Fprintf(os.Stderr, "input files: %d\n", len(inputFiles))
 
 	var (
-		allPoints   []models.Trackpoint
-		allLapIdx   []int
-		lapsAdded   int
-		sessionLogs []string
-		masterTrack []models.Trackpoint
-		sessions    []sessionResult
+		allPoints      []models.Trackpoint
+		allLapIdx      []int
+		lapsAdded      int
+		sessionLogs    []string
+		masterTrack    []models.Trackpoint
+		sessions       []sessionResult
+		detectedSprint bool
 	)
 	allLapIdx = append(allLapIdx, 0)
 
@@ -128,6 +142,7 @@ func main() {
 				results <- sessionResult{path: p, err: fmt.Errorf("load: %w", err)}
 				return
 			}
+			telemetryLapIdx := track.LapIdxFromTelemetry(samples)
 			tp, err := track.BuildTrack(samples)
 			if err != nil {
 				results <- sessionResult{path: p, err: fmt.Errorf("track: %w", err)}
@@ -136,17 +151,36 @@ func main() {
 			events := track.DetectEvents(samples)
 			sessionDist := tp[len(tp)-1].S
 			sessionTime := samples[len(samples)-1].Time - samples[0].Time
-			raceType := "lapped"
+			lapIdx := track.DetectLapsNearStart(tp, *startFinishRadius, *minLapSpacing)
+			loop := len(lapIdx) > 2
+			raceType := "sprint"
+			laps := 1
 			if *sprintMode {
 				raceType = "sprint"
+			} else if telemetryLapIdx != nil {
+				raceType = "lapped"
+				laps = len(telemetryLapIdx) - 1
+			} else if *lapCount > 0 {
+				laps = *lapCount
+				if laps > 1 {
+					raceType = "lapped"
+				}
+			} else if loop {
+				raceType = "lapped"
+				laps = track.DeriveLapCount(sessionDist, *lapCount)
 			}
-			laps := track.DeriveLapCount(sessionDist, *lapCount)
-			if raceType == "sprint" {
-				laps = 1
-			}
-			lapIdx := []int{0, len(tp)}
-			if raceType != "sprint" {
-				lapIdx = track.BuildLapIdx(tp, laps, *lapLen, *lapTol, *minLapSpacing)
+			if raceType == "lapped" {
+				if telemetryLapIdx != nil {
+					lapIdx = telemetryLapIdx
+				} else {
+					enforce := *lapCount > 0
+					lapIdx = track.BuildLapIdx(tp, laps, *lapLen, *lapTol, *minLapSpacing, enforce, *startFinishRadius)
+					if enforce && len(lapIdx) == 2 && laps > 1 {
+						lapIdx = track.BuildEvenLapIdx(tp, laps)
+					}
+				}
+			} else {
+				lapIdx = []int{0, len(tp)}
 			}
 			results <- sessionResult{
 				path:    p,
@@ -173,16 +207,17 @@ func main() {
 			continue
 		}
 
+		if res.race == "sprint" {
+			detectedSprint = true
+		}
+
 		for i := 0; i < len(res.lapIdx)-1; i++ {
 			seg := res.track[res.lapIdx[i]:res.lapIdx[i+1]]
-			if res.race != "sprint" {
-				seg = track.NormalizeLapSegment(seg)
-			}
 			allPoints = append(allPoints, seg...)
 			allLapIdx = append(allLapIdx, len(allPoints))
 			lapsAdded++
 			// In sprint mode, we only want a single pass; break once added.
-			if *sprintMode {
+			if *sprintMode || res.race == "sprint" {
 				break
 			}
 		}
@@ -204,7 +239,9 @@ func main() {
 	trackPoints := allPoints
 	lapIdx := allLapIdx
 
-	if *sprintMode {
+	effectiveSprint := *sprintMode || detectedSprint
+
+	if effectiveSprint {
 		if *useMaster {
 			master := track.BuildMasterPath(trackPoints, *masterSamples, false)
 			if len(master) > 0 {
@@ -227,7 +264,7 @@ func main() {
 	}
 
 	if masterTrack == nil {
-		if *sprintMode {
+		if effectiveSprint {
 			masterTrack = track.BuildMasterPath(trackPoints, *masterSamples, false)
 		} else {
 			masterTrack = track.BuildMasterLap(trackPoints, lapIdx, *masterSamples)
@@ -311,36 +348,94 @@ func main() {
 			longAcc := make([]float64, len(sess.samples))
 			latAcc := make([]float64, len(sess.samples))
 			yawRate := make([]float64, len(sess.samples))
-			steerDeg := track.ComputeSteeringAngles(sess.track, 2.8)
 			var maxPosAcc, maxNegAcc float64
 			var posSamples, negSamples []float64
-			for i := 1; i < len(sess.samples) && i < len(sess.track); i++ {
-				dt := sess.samples[i].Time - sess.samples[i-1].Time
-				if dt <= 0 {
-					continue
+
+			// Prefer direct telemetry values when present.
+			useDirectAcc := false
+			useDirectYaw := false
+			var suspFLSm, suspFRSm, suspRLSm, suspRRSm []float64
+			for i := 0; i < len(sess.samples); i++ {
+				longAcc[i] = sess.samples[i].AccelX
+				latAcc[i] = sess.samples[i].AccelY
+				yawRate[i] = sess.samples[i].AngVelY
+				if longAcc[i] != 0 {
+					useDirectAcc = true
+					if longAcc[i] > maxPosAcc {
+						maxPosAcc = longAcc[i]
+					}
+					if longAcc[i] < maxNegAcc {
+						maxNegAcc = longAcc[i]
+					}
+					if longAcc[i] > 0 {
+						posSamples = append(posSamples, longAcc[i])
+					} else if longAcc[i] < 0 {
+						negSamples = append(negSamples, -longAcc[i])
+					}
 				}
-				dv := sess.samples[i].Speed - sess.samples[i-1].Speed
-				longAcc[i] = dv / dt
-				if longAcc[i] > maxPosAcc {
-					maxPosAcc = longAcc[i]
+				if yawRate[i] != 0 {
+					useDirectYaw = true
 				}
-				if longAcc[i] < maxNegAcc {
-					maxNegAcc = longAcc[i]
+			}
+
+			// Fall back to derived values if direct telemetry is unavailable/zeroed.
+			if !useDirectAcc {
+				maxPosAcc, maxNegAcc = 0, 0
+				posSamples, negSamples = nil, nil
+				for i := 1; i < len(sess.samples) && i < len(sess.track); i++ {
+					dt := sess.samples[i].Time - sess.samples[i-1].Time
+					if dt <= 0 {
+						continue
+					}
+					dv := sess.samples[i].Speed - sess.samples[i-1].Speed
+					longAcc[i] = dv / dt
+					if longAcc[i] > maxPosAcc {
+						maxPosAcc = longAcc[i]
+					}
+					if longAcc[i] < maxNegAcc {
+						maxNegAcc = longAcc[i]
+					}
+					if longAcc[i] > 0 {
+						posSamples = append(posSamples, longAcc[i])
+					} else if longAcc[i] < 0 {
+						negSamples = append(negSamples, -longAcc[i])
+					}
 				}
-				if longAcc[i] > 0 {
-					posSamples = append(posSamples, longAcc[i])
-				} else if longAcc[i] < 0 {
-					negSamples = append(negSamples, -longAcc[i])
+			}
+			if !useDirectYaw {
+				for i := 1; i < len(sess.samples) && i < len(sess.track); i++ {
+					dt := sess.samples[i].Time - sess.samples[i-1].Time
+					if dt <= 0 {
+						continue
+					}
+					dh := sess.track[i].Theta - sess.track[i-1].Theta
+					for dh > math.Pi {
+						dh -= 2 * math.Pi
+					}
+					for dh < -math.Pi {
+						dh += 2 * math.Pi
+					}
+					yawRate[i] = dh / dt
+					if latAcc[i] == 0 {
+						latAcc[i] = sess.samples[i].Speed * yawRate[i]
+					}
 				}
-				dh := sess.track[i].Theta - sess.track[i-1].Theta
-				for dh > math.Pi {
-					dh -= 2 * math.Pi
+
+				// Smooth suspension travel for display.
+				suspFLRaw := make([]float64, len(sess.samples))
+				suspFRRaw := make([]float64, len(sess.samples))
+				suspRLRaw := make([]float64, len(sess.samples))
+				suspRRRaw := make([]float64, len(sess.samples))
+				for i := range sess.samples {
+					suspFLRaw[i] = sess.samples[i].SuspTravelFL
+					suspFRRaw[i] = sess.samples[i].SuspTravelFR
+					suspRLRaw[i] = sess.samples[i].SuspTravelRL
+					suspRRRaw[i] = sess.samples[i].SuspTravelRR
 				}
-				for dh < -math.Pi {
-					dh += 2 * math.Pi
-				}
-				yawRate[i] = dh / dt
-				latAcc[i] = sess.samples[i].Speed * yawRate[i]
+				suspFLSm = track.SmoothSeries(suspFLRaw, 5)
+				suspFRSm = track.SmoothSeries(suspFRRaw, 5)
+				suspRLSm = track.SmoothSeries(suspRLRaw, 5)
+				suspRRSm = track.SmoothSeries(suspRRRaw, 5)
 			}
 			scalePos := percentile(posSamples, 0.9)
 			if scalePos <= 0 {
@@ -375,40 +470,71 @@ func main() {
 						lapStartTime[lapNum] = 0
 					}
 				}
-				track.MapToMaster(segment, masterTrack, start, func(idx int, relS, x, y float64, mi int, mRelS, mx, my, dist float64) {
+				masterLen := masterTrack[len(masterTrack)-1].S
+				lapLen := 0.0
+				if len(segment) > 0 {
+					lapLen = segment[len(segment)-1].S - segment[0].S
+				}
+				scaleS := 1.0
+				if lapLen > 0 && masterLen > 0 {
+					scaleS = masterLen / lapLen
+				}
+				track.MapToMaster(segment, masterTrack, start, scaleS, func(idx int, relS, x, y float64, mi int, mRelS, mx, my, dist float64) {
 					var heading, speedMPH, speedKMH float64
 					var gear int
 					var t float64
 					var accel float64
 					var lngAcc, ltAcc, yr float64
 					var steer float64
+					var suspFL, suspFR, suspRL, suspRR float64
+					var tempFL, tempFR, tempRL, tempRR float64
 					if idx >= 0 && idx < len(sess.track) {
 						heading = sess.track[idx].Theta
 						yr = yawRate[idx]
-						steer = steerDeg[idx]
 					}
 					if idx >= 0 && idx < len(sess.samples) {
 						speedMPH = sess.samples[idx].SpeedMPH
 						speedKMH = sess.samples[idx].SpeedKMH
 						gear = sess.samples[idx].Gear
 						t = sess.samples[idx].Time - sess.samples[0].Time
-						if idx > 0 {
-							prev := sess.samples[idx-1]
-							prevSpeed := prev.SpeedMPH
-							if prevSpeed == 0 {
-								prevSpeed = prev.Speed * 2.23694
-							}
-							curSpeed := speedMPH
-							if curSpeed == 0 {
-								curSpeed = sess.samples[idx].Speed * 2.23694
-							}
-							dt := sess.samples[idx].Time - prev.Time
-							if dt > 0 {
-								accel = (curSpeed - prevSpeed) / dt
-							}
-						}
 						lngAcc = longAcc[idx]
 						ltAcc = latAcc[idx]
+						if idx < len(suspFLSm) {
+							suspFL = suspFLSm[idx]
+						} else {
+							suspFL = sess.samples[idx].SuspTravelFL
+						}
+						if idx < len(suspFRSm) {
+							suspFR = suspFRSm[idx]
+						} else {
+							suspFR = sess.samples[idx].SuspTravelFR
+						}
+						if idx < len(suspRLSm) {
+							suspRL = suspRLSm[idx]
+						} else {
+							suspRL = sess.samples[idx].SuspTravelRL
+						}
+						if idx < len(suspRRSm) {
+							suspRR = suspRRSm[idx]
+						} else {
+							suspRR = sess.samples[idx].SuspTravelRR
+						}
+						tempFL = toCelsius(sess.samples[idx].TireTempFL)
+						tempFR = toCelsius(sess.samples[idx].TireTempFR)
+						tempRL = toCelsius(sess.samples[idx].TireTempRL)
+						tempRR = toCelsius(sess.samples[idx].TireTempRR)
+						// Prefer accel from speed delta over time; fallback to telemetry longitudinal accel.
+						if idx > 0 {
+							prev := sess.samples[idx-1]
+							dt := sess.samples[idx].Time - prev.Time
+							if dt > 0 {
+								dv := sess.samples[idx].Speed - prev.Speed
+								accel = dv / dt
+							}
+						}
+						if accel == 0 {
+							accel = lngAcc
+						}
 					}
 					if speedMPH == 0 && speedKMH > 0 {
 						speedMPH = speedKMH * 0.621371
@@ -457,6 +583,18 @@ func main() {
 						}
 						return v
 					}
+					clampSym := func(v float64) float64 {
+						if math.IsNaN(v) || math.IsInf(v, 0) {
+							return 0
+						}
+						if v > 1 {
+							return 1
+						}
+						if v < -1 {
+							return -1
+						}
+						return v
+					}
 					throttle := clamp01(lngAcc / scalePos)
 					brake := clamp01(-lngAcc / scaleNeg)
 					if lngAcc >= 0 {
@@ -465,24 +603,51 @@ func main() {
 					if lngAcc <= 0 {
 						throttle = math.Max(0, throttle)
 					}
+					var throttleInput, brakeInput, steerInput float64
+					if idx >= 0 && idx < len(sess.samples) {
+						sample := sess.samples[idx]
+						if sample.HasInputAccel || sample.HasInputBrake {
+							throttleInput = clamp01(float64(sample.ThrottleRaw) / 255.0)
+							brakeInput = clamp01(float64(sample.Brake) / 255.0)
+							throttle = throttleInput
+							brake = brakeInput
+						}
+						if sample.HasInputSteer {
+							steerInput = clampSym(float64(sample.Steer) / 127.0)
+							steer = float64(sample.Steer)
+						} else {
+							steer = 0
+						}
+					}
 					res.car.Points = append(res.car.Points, carPoint{
-						Time:     t,
-						Lap:      lapNum,
-						RelS:     relS,
-						Heading:  heading,
-						MasterX:  mx,
-						MasterY:  my,
-						SpeedMPH: speedMPH,
-						SpeedKMH: speedKMH,
-						Gear:     gear,
-						Delta:    delta,
-						LongAcc:  lngAcc,
-						LatAcc:   ltAcc,
-						YawRate:  yr,
-						YawDegS:  yr * 180 / math.Pi,
-						Throttle: throttle,
-						Brake:    brake,
-						SteerDeg: steer,
+						Time:          t,
+						Lap:           lapNum,
+						RelS:          relS,
+						Heading:       heading,
+						MasterX:       mx,
+						MasterY:       my,
+						SpeedMPH:      speedMPH,
+						SpeedKMH:      speedKMH,
+						Gear:          gear,
+						Delta:         delta,
+						LongAcc:       lngAcc,
+						LatAcc:        ltAcc,
+						YawRate:       yr,
+						YawDegS:       yr * 180 / math.Pi,
+						Throttle:      throttle,
+						Brake:         brake,
+						SteerDeg:      steer,
+						ThrottleInput: throttleInput,
+						BrakeInput:    brakeInput,
+						SteerInput:    steerInput,
+						SuspFL:        suspFL,
+						SuspFR:        suspFR,
+						SuspRL:        suspRL,
+						SuspRR:        suspRR,
+						TireTempFL:    tempFL,
+						TireTempFR:    tempFR,
+						TireTempRL:    tempRL,
+						TireTempRR:    tempRR,
 					})
 					if currentSurface != "" && currentSurface != lastSurface {
 						res.events = append(res.events, eventOut{
@@ -793,6 +958,10 @@ func pointAtTime(points []carPoint, t float64) (carPoint, bool) {
 	}, true
 }
 
+func toCelsius(tempF float64) float64 {
+	return (tempF - 32.0) * 5.0 / 9.0
+}
+
 func percentile(vals []float64, p float64) float64 {
 	if len(vals) == 0 {
 		return 0
@@ -859,65 +1028,179 @@ func LoadSamplesFromCSV(path string) ([]models.Sample, error) {
 		return v
 	}
 
-	for _, row := range rows {
-		// Convert ms timestamp to seconds
-		timeSec := parseOrZero(row[cols["timestampms"]]) / 1000.0
-		speed := parseOrZero(row[cols["speed_mps"]])
+	getFloat := func(row []string, name string) float64 {
+		if idx, ok := cols[name]; ok && idx < len(row) {
+			return parseOrZero(row[idx])
+		}
+		return 0
+	}
 
-		ax := parseOrZero(row[cols["accel_x"]])
-		ay := parseOrZero(row[cols["accel_y"]])
-		az := parseOrZero(row[cols["accel_z"]])
-
-		vx := parseOrZero(row[cols["vel_x"]])
-		vy := parseOrZero(row[cols["vel_y"]])
-		vz := parseOrZero(row[cols["vel_z"]])
-
-		var speedMPH, speedKMH float64
-		if idx, ok := cols["speed_mph"]; ok {
-			speedMPH = parseOrZero(row[idx])
-		}
-		if idx, ok := cols["speed_kmh"]; ok {
-			speedKMH = parseOrZero(row[idx])
-		}
-		if speedKMH == 0 {
-			speedKMH = speed * 3.6
-		}
-		if speedMPH == 0 {
-			speedMPH = speed * 2.23694
-		}
-
-		gear := 0
-		if idx, ok := cols["gear"]; ok {
-			gear = int(parseOrZero(row[idx]))
-		}
-		isRaceOn := 1
-		if idx, ok := cols["israceon"]; ok {
+	getInt := func(row []string, name string) (int, bool) {
+		if idx, ok := cols[name]; ok && idx < len(row) {
 			val := strings.TrimSpace(strings.ToLower(row[idx]))
 			switch val {
 			case "true", "1", "yes", "on":
-				isRaceOn = 1
+				return 1, true
 			case "false", "0", "no", "off":
-				isRaceOn = 0
-			default:
-				isRaceOn = int(parseOrZero(row[idx]))
+				return 0, true
 			}
+			return int(parseOrZero(row[idx])), true
+		}
+		return 0, false
+	}
+
+	getString := func(row []string, name string) string {
+		if idx, ok := cols[name]; ok && idx < len(row) {
+			return row[idx]
+		}
+		return ""
+	}
+
+	for _, row := range rows {
+		timeMS := getFloat(row, "timestampms")
+		timeSec := timeMS / 1000.0
+
+		ax := getFloat(row, "accel_x")
+		ay := getFloat(row, "accel_y")
+		az := getFloat(row, "accel_z")
+
+		vx := getFloat(row, "vel_x")
+		vy := getFloat(row, "vel_y")
+		vz := getFloat(row, "vel_z")
+
+		speedMPS := getFloat(row, "speed_mps")
+		speedKMH := getFloat(row, "speed_kph")
+		speedMPH := getFloat(row, "speed_mph")
+		if speedMPS == 0 && speedKMH > 0 {
+			speedMPS = speedKMH / 3.6
+		}
+		if speedMPS == 0 && speedMPH > 0 {
+			speedMPS = speedMPH / 2.23694
+		}
+		if speedKMH == 0 && speedMPS > 0 {
+			speedKMH = speedMPS * 3.6
+		}
+		if speedMPH == 0 && speedMPS > 0 {
+			speedMPH = speedMPS * 2.23694
 		}
 
-		samples = append(samples, models.Sample{
-			Time:     timeSec,
-			Speed:    speed,
-			AccelX:   ax,
-			AccelY:   ay,
-			AccelZ:   az,
-			VelX:     vx,
-			VelY:     vy,
-			VelZ:     vz,
-			IsRaceOn: isRaceOn,
-			SpeedMPH: speedMPH,
-			SpeedKMH: speedKMH,
-			Gear:     gear,
-			SmoothAx: ax, // seed smoother with raw value
-		})
+		gear, _ := getInt(row, "gear")
+		isRaceOn, hasIsRaceOn := getInt(row, "israceon")
+		if _, ok := cols["israceon"]; !ok {
+			isRaceOn = 1
+		} else if isRaceOn != 0 {
+			isRaceOn = 1
+		}
+		throttleRaw, hasAccel := getInt(row, "accel")
+		brakeRaw, hasBrake := getInt(row, "brake")
+		steerRaw, hasSteer := getInt(row, "steer")
+
+		s := models.Sample{
+			CarState: models.CarState{
+				Timestamp:           getString(row, "timestamp"),
+				IsRaceOn:            isRaceOn,
+				TimestampMS:         timeMS,
+				EngineMaxRPM:        getFloat(row, "engine_max_rpm"),
+				EngineIdleRPM:       getFloat(row, "engine_idle_rpm"),
+				EngineCurrentRPM:    getFloat(row, "engine_current_rpm"),
+				AccelX:              ax,
+				AccelY:              ay,
+				AccelZ:              az,
+				VelX:                vx,
+				VelY:                vy,
+				VelZ:                vz,
+				AngVelX:             getFloat(row, "ang_vel_x"),
+				AngVelY:             getFloat(row, "ang_vel_y"),
+				AngVelZ:             getFloat(row, "ang_vel_z"),
+				Yaw:                 getFloat(row, "yaw"),
+				Pitch:               getFloat(row, "pitch"),
+				Roll:                getFloat(row, "roll"),
+				NormSuspFL:          getFloat(row, "norm_susp_fl"),
+				NormSuspFR:          getFloat(row, "norm_susp_fr"),
+				NormSuspRL:          getFloat(row, "norm_susp_rl"),
+				NormSuspRR:          getFloat(row, "norm_susp_rr"),
+				TireSlipFL:          getFloat(row, "tire_slip_fl"),
+				TireSlipFR:          getFloat(row, "tire_slip_fr"),
+				TireSlipRL:          getFloat(row, "tire_slip_rl"),
+				TireSlipRR:          getFloat(row, "tire_slip_rr"),
+				WheelRotFL:          getFloat(row, "wheel_rot_fl"),
+				WheelRotFR:          getFloat(row, "wheel_rot_fr"),
+				WheelRotRL:          getFloat(row, "wheel_rot_rl"),
+				WheelRotRR:          getFloat(row, "wheel_rot_rr"),
+				WheelOnRumbleFL:     getFloat(row, "wheel_on_rumble_fl"),
+				WheelOnRumbleFR:     getFloat(row, "wheel_on_rumble_fr"),
+				WheelOnRumbleRL:     getFloat(row, "wheel_on_rumble_rl"),
+				WheelOnRumbleRR:     getFloat(row, "wheel_on_rumble_rr"),
+				WheelInPuddleFL:     getFloat(row, "wheel_in_puddle_fl"),
+				WheelInPuddleFR:     getFloat(row, "wheel_in_puddle_fr"),
+				WheelInPuddleRL:     getFloat(row, "wheel_in_puddle_rl"),
+				WheelInPuddleRR:     getFloat(row, "wheel_in_puddle_rr"),
+				SurfaceRumbleFL:     getFloat(row, "surface_rumble_fl"),
+				SurfaceRumbleFR:     getFloat(row, "surface_rumble_fr"),
+				SurfaceRumbleRL:     getFloat(row, "surface_rumble_rl"),
+				SurfaceRumbleRR:     getFloat(row, "surface_rumble_rr"),
+				TireSlipAngleFL:     getFloat(row, "tire_slip_angle_fl"),
+				TireSlipAngleFR:     getFloat(row, "tire_slip_angle_fr"),
+				TireSlipAngleRL:     getFloat(row, "tire_slip_angle_rl"),
+				TireSlipAngleRR:     getFloat(row, "tire_slip_angle_rr"),
+				TireCombinedSlipFL:  getFloat(row, "tire_combined_slip_fl"),
+				TireCombinedSlipFR:  getFloat(row, "tire_combined_slip_fr"),
+				TireCombinedSlipRL:  getFloat(row, "tire_combined_slip_rl"),
+				TireCombinedSlipRR:  getFloat(row, "tire_combined_slip_rr"),
+				SuspTravelFL:        getFloat(row, "susp_travel_fl"),
+				SuspTravelFR:        getFloat(row, "susp_travel_fr"),
+				SuspTravelRL:        getFloat(row, "susp_travel_rl"),
+				SuspTravelRR:        getFloat(row, "susp_travel_rr"),
+				CarOrdinal:          int(getFloat(row, "car_ordinal")),
+				CarClass:            int(getFloat(row, "car_class")),
+				CarPerformanceIndex: int(getFloat(row, "car_performance_index")),
+				DrivetrainType:      int(getFloat(row, "drivetrain_type")),
+				NumCylinders:        int(getFloat(row, "num_cylinders")),
+				PosX:                getFloat(row, "pos_x"),
+				PosY:                getFloat(row, "pos_y"),
+				PosZ:                getFloat(row, "pos_z"),
+				SpeedMPS:            speedMPS,
+				SpeedKMH:            speedKMH,
+				SpeedMPH:            speedMPH,
+				Power:               getFloat(row, "power"),
+				Torque:              getFloat(row, "torque"),
+				TireTempFL:          getFloat(row, "tire_temp_fl"),
+				TireTempFR:          getFloat(row, "tire_temp_fr"),
+				TireTempRL:          getFloat(row, "tire_temp_rl"),
+				TireTempRR:          getFloat(row, "tire_temp_rr"),
+				Boost:               getFloat(row, "boost"),
+				Fuel:                getFloat(row, "fuel"),
+				Distance:            getFloat(row, "distance"),
+				BestLap:             getFloat(row, "best_lap"),
+				LastLap:             getFloat(row, "last_lap"),
+				CurrentLap:          getFloat(row, "current_lap"),
+				CurrentRaceTime:     getFloat(row, "current_race_time"),
+				LapNumber:           int(getFloat(row, "lap_number")),
+				RacePosition:        int(getFloat(row, "race_position")),
+				ThrottleRaw:         throttleRaw,
+				Brake:               brakeRaw,
+				Clutch:              int(getFloat(row, "clutch")),
+				Handbrake:           int(getFloat(row, "handbrake")),
+				Gear:                gear,
+				Steer:               steerRaw,
+				NormDrivingLine:     int(getFloat(row, "norm_driving_line")),
+				NormAIBrakeDiff:     int(getFloat(row, "norm_ai_brake_diff")),
+			},
+			Time:          timeSec,
+			Speed:         speedMPS,
+			SmoothAx:      ax, // seed smoother with raw value
+			HasInputAccel: hasAccel,
+			HasInputBrake: hasBrake,
+			HasInputSteer: hasSteer,
+		}
+		if hasIsRaceOn {
+			s.IsRaceOn = isRaceOn
+		}
+		if s.IsRaceOn == 0 {
+			continue
+		}
+
+		samples = append(samples, s)
 	}
 
 	return samples, nil

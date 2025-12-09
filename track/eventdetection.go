@@ -1,6 +1,7 @@
 package track
 
 import (
+	"fmt"
 	"forza/models"
 	"math"
 )
@@ -14,6 +15,12 @@ type EventThresholds struct {
 	ResetMinDuration   float64 // seconds near-zero to call a reset
 	ResetVelEpsilon    float64 // m/s velocity magnitude considered zero
 	DedupeWindow       float64 // seconds to dedupe same-type events
+	RumbleThreshold    float64 // wheel_on_rumble sum to flag rumble
+	PuddleThreshold    float64 // wheel_in_puddle sum to flag puddle
+	DriftSlipAngle     float64 // avg abs slip angle (rad) to flag drift
+	DriftMinSpeed      float64 // min speed to consider drift (m/s)
+	TractionSlip       float64 // combined slip to flag traction loss
+	TractionThrottle   float64 // throttle raw min to consider traction loss
 }
 
 func defaultEventThresholds() EventThresholds {
@@ -26,6 +33,12 @@ func defaultEventThresholds() EventThresholds {
 		ResetMinDuration:   1.5,
 		ResetVelEpsilon:    0.25,
 		DedupeWindow:       1.0,
+		RumbleThreshold:    0.8,
+		PuddleThreshold:    0.5,
+		DriftSlipAngle:     0.3, // ~17 degrees
+		DriftMinSpeed:      8.0, // m/s
+		TractionSlip:       0.4,
+		TractionThrottle:   120,
 	}
 }
 
@@ -42,6 +55,10 @@ func DetectEvents(samples []models.Sample) []models.Event {
 	resetStart := -1
 	resetAccum := 0.0
 	seenOn := false
+	driftActive := false
+	tractionActive := false
+
+	lastPos := -1
 
 	for i := 1; i < len(samples); i++ {
 		prev := samples[i-1]
@@ -62,13 +79,17 @@ func DetectEvents(samples []models.Sample) []models.Event {
 			continue
 		}
 
+		if prev.RacePosition > 0 {
+			lastPos = prev.RacePosition
+		}
+
 		dt := cur.Time - prev.Time
 		if dt <= 0 || dt > 1.0 || math.IsNaN(dt) || math.IsInf(dt, 0) {
 			dt = 0
 		}
 
-		speedPrev := cleanFloat(prev.Speed, 0)
-		speedCur := cleanFloat(cur.Speed, 0)
+		speedPrev := speedMPS(prev)
+		speedCur := speedMPS(cur)
 		dSpeed := speedCur - speedPrev
 		decel := 0.0
 		if dt > 0 {
@@ -77,6 +98,34 @@ func DetectEvents(samples []models.Sample) []models.Event {
 
 		accelMag := math.Sqrt(cur.AccelX*cur.AccelX + cur.AccelY*cur.AccelY + cur.AccelZ*cur.AccelZ)
 		velMag := math.Hypot(cur.VelX, cur.VelZ)
+
+		// Position gain/loss and pole changes.
+		if lastPos > 0 && cur.RacePosition > 0 && cur.RacePosition != lastPos {
+			posChange := cur.RacePosition - lastPos
+			var evType string
+			note := fmt.Sprintf("position %d → %d", lastPos, cur.RacePosition)
+			if posChange < 0 {
+				evType = "position_gain"
+			} else {
+				evType = "position_loss"
+			}
+			if okToEmit(lastOfType[evType], cur.Time, th.DedupeWindow) {
+				events = append(events, models.Event{Index: i, Time: cur.Time, Type: evType, Note: note})
+				lastOfType[evType] = cur.Time
+			}
+			if lastPos == 1 && cur.RacePosition > 1 {
+				if okToEmit(lastOfType["pole_loss"], cur.Time, th.DedupeWindow) {
+					events = append(events, models.Event{Index: i, Time: cur.Time, Type: "pole_loss", Note: note})
+					lastOfType["pole_loss"] = cur.Time
+				}
+			} else if lastPos > 1 && cur.RacePosition == 1 {
+				if okToEmit(lastOfType["pole_gain"], cur.Time, th.DedupeWindow) {
+					events = append(events, models.Event{Index: i, Time: cur.Time, Type: "pole_gain", Note: note})
+					lastOfType["pole_gain"] = cur.Time
+				}
+			}
+			lastPos = cur.RacePosition
+		}
 
 		// Reset detection: sustained near-zero movement.
 		if velMag < th.ResetVelEpsilon && speedCur < th.StopSpeed {
@@ -113,6 +162,44 @@ func DetectEvents(samples []models.Sample) []models.Event {
 				lastOfType["collision"] = cur.Time
 			}
 		}
+
+		// Rumble strip contact.
+		rumble := cur.WheelOnRumbleFL + cur.WheelOnRumbleFR + cur.WheelOnRumbleRL + cur.WheelOnRumbleRR
+		if rumble >= th.RumbleThreshold && okToEmit(lastOfType["rumble"], cur.Time, th.DedupeWindow) {
+			events = append(events, models.Event{Index: i, Time: cur.Time, Type: "rumble", Note: "wheel on rumble"})
+			lastOfType["rumble"] = cur.Time
+		}
+
+		// Puddle/wet contact.
+		puddle := cur.WheelInPuddleFL + cur.WheelInPuddleFR + cur.WheelInPuddleRL + cur.WheelInPuddleRR
+		if puddle >= th.PuddleThreshold && okToEmit(lastOfType["puddle"], cur.Time, th.DedupeWindow) {
+			events = append(events, models.Event{Index: i, Time: cur.Time, Type: "puddle", Note: "wheel in puddle"})
+			lastOfType["puddle"] = cur.Time
+		}
+
+		// Drift: sustained high slip angles at speed.
+		slipAng := (math.Abs(cur.TireSlipAngleFL) + math.Abs(cur.TireSlipAngleFR) + math.Abs(cur.TireSlipAngleRL) + math.Abs(cur.TireSlipAngleRR)) / 4
+		if slipAng >= th.DriftSlipAngle && speedCur >= th.DriftMinSpeed {
+			if !driftActive && okToEmit(lastOfType["drift"], cur.Time, th.DedupeWindow) {
+				events = append(events, models.Event{Index: i, Time: cur.Time, Type: "drift", Note: "high slip angle"})
+				lastOfType["drift"] = cur.Time
+			}
+			driftActive = true
+		} else {
+			driftActive = false
+		}
+
+		// Traction loss: high combined slip under throttle.
+		avgSlip := (cur.TireCombinedSlipFL + cur.TireCombinedSlipFR + cur.TireCombinedSlipRL + cur.TireCombinedSlipRR) / 4
+		if avgSlip >= th.TractionSlip && cur.ThrottleRaw >= int(th.TractionThrottle) && speedCur >= th.StopSpeed {
+			if !tractionActive && okToEmit(lastOfType["traction"], cur.Time, th.DedupeWindow) {
+				events = append(events, models.Event{Index: i, Time: cur.Time, Type: "traction", Note: "traction loss"})
+				lastOfType["traction"] = cur.Time
+			}
+			tractionActive = true
+		} else {
+			tractionActive = false
+		}
 	}
 
 	return events
@@ -123,6 +210,16 @@ func okToEmit(lastTime float64, now float64, window float64) bool {
 		return true
 	}
 	return now-lastTime >= window
+}
+
+func speedMPS(s models.Sample) float64 {
+	if s.Speed > 0 {
+		return s.Speed
+	}
+	if s.SpeedMPS > 0 {
+		return s.SpeedMPS
+	}
+	return 0
 }
 
 // MappedPoint represents a point mapped to master coordinates for cross-car comparisons.

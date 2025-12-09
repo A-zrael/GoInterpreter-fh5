@@ -21,7 +21,7 @@ func BuildMasterLap(points []models.Trackpoint, lapIdx []int, samples int) []mod
 		lapIdx = append(lapIdx, len(points))
 	}
 
-	// 1) Resample each lap to 'samples' points
+	// 1) Resample each lap to 'samples' points using absolute positions (no rotation/closing).
 	laps := make([][]models.Trackpoint, 0, len(lapIdx)-1)
 	for i := 0; i < len(lapIdx)-1; i++ {
 		start := lapIdx[i]
@@ -32,8 +32,7 @@ func BuildMasterLap(points []models.Trackpoint, lapIdx []int, samples int) []mod
 		if end <= start+1 {
 			continue
 		}
-		lap := NormalizeLapSegment(points[start:end])
-		lap = resampleLap(lap, 0, len(lap), samples)
+		lap := resampleLap(NormalizeLapSegment(points[start:end]), 0, end-start, samples)
 		if lap != nil {
 			laps = append(laps, lap)
 		}
@@ -42,31 +41,21 @@ func BuildMasterLap(points []models.Trackpoint, lapIdx []int, samples int) []mod
 		return nil
 	}
 
-	// 2) Use first lap as reference
-	ref := laps[0]
-
-	aligned := make([][]models.Trackpoint, len(laps))
-	aligned[0] = ref
-
-	// Align each subsequent lap to the reference
-	for i := 1; i < len(laps); i++ {
-		aligned[i] = alignLapToRef(ref, laps[i])
-	}
-
-	// 3) Average aligned laps
+	// 2) Average laps in world space (no rotation/scale).
 	master := make([]models.Trackpoint, samples)
 	for i := 0; i < samples; i++ {
-		var sx, sy float64
-		for l := 0; l < len(aligned); l++ {
-			sx += aligned[l][i].X
-			sy += aligned[l][i].Y
+		var sx, sy, st float64
+		for l := 0; l < len(laps); l++ {
+			sx += laps[l][i].X
+			sy += laps[l][i].Y
+			st += laps[l][i].Theta
 		}
-		n := float64(len(aligned))
+		n := float64(len(laps))
 		master[i] = models.Trackpoint{
-			S:     ref[i].S, // distance along lap (local)
+			S:     laps[0][i].S, // local distance along lap
 			X:     sx / n,
 			Y:     sy / n,
-			Theta: 0, // optional; you can average heading if needed
+			Theta: st / n,
 		}
 	}
 
@@ -80,12 +69,8 @@ func BuildMasterPath(points []models.Trackpoint, samples int, closeLoop bool) []
 	if len(points) < 2 || samples < 2 {
 		return nil
 	}
-	var prep []models.Trackpoint
-	if closeLoop {
-		prep = NormalizeLapSegment(points)
-	} else {
-		prep = RecomputeArcLength(points)
-	}
+	// Preserve absolute positions; only recompute arc length for spacing.
+	prep := RecomputeArcLength(points)
 	return resampleLap(prep, 0, len(prep), samples)
 }
 
@@ -143,157 +128,49 @@ func resampleLap(points []models.Trackpoint, start, end, samples int) []models.T
 	return out
 }
 
-// alignLapToRef: rotate + translate 'lap' so it best fits 'ref'.
-func alignLapToRef(ref, lap []models.Trackpoint) []models.Trackpoint {
-	n := len(ref)
-	if len(lap) != n || n == 0 {
-		return lap
-	}
-
-	// centroids
-	var cxRef, cyRef, cxLap, cyLap float64
-	for i := 0; i < n; i++ {
-		cxRef += ref[i].X
-		cyRef += ref[i].Y
-		cxLap += lap[i].X
-		cyLap += lap[i].Y
-	}
-	invN := 1.0 / float64(n)
-	cxRef *= invN
-	cyRef *= invN
-	cxLap *= invN
-	cyLap *= invN
-
-	// compute a,b for optimal rotation
-	var a, b float64
-	for i := 0; i < n; i++ {
-		rx := ref[i].X - cxRef
-		ry := ref[i].Y - cyRef
-		lx := lap[i].X - cxLap
-		ly := lap[i].Y - cyLap
-
-		a += lx*rx + ly*ry // dot
-		b += lx*ry - ly*rx // cross (z component)
-	}
-
-	denom := math.Hypot(a, b)
-	cosT, sinT := 1.0, 0.0
-	if denom > 0 {
-		cosT = a / denom
-		sinT = b / denom
-	}
-
-	// Compute optimal isotropic scale to minimize SSE after rotation.
-	var num, den float64
-	for i := 0; i < n; i++ {
-		lx := lap[i].X - cxLap
-		ly := lap[i].Y - cyLap
-		rx := ref[i].X - cxRef
-		ry := ref[i].Y - cyRef
-		rxPrime := cosT*lx - sinT*ly
-		ryPrime := sinT*lx + cosT*ly
-		num += rx*rxPrime + ry*ryPrime
-		den += lx*lx + ly*ly
-	}
-	scale := 1.0
-	if den > 0 {
-		scale = num / den
-	}
-
-	out := make([]models.Trackpoint, n)
-	for i := 0; i < n; i++ {
-		dx := lap[i].X - cxLap
-		dy := lap[i].Y - cyLap
-
-		x := (cosT*dx - sinT*dy) * scale
-		y := (sinT*dx + cosT*dy) * scale
-		x += cxRef
-		y += cyRef
-
-		out[i] = models.Trackpoint{
-			S:     lap[i].S, // local S stays as-is
-			X:     x,
-			Y:     y,
-			Theta: lap[i].Theta, // you can adjust if you like
-		}
-	}
-
-	// Anchor start point to reference start to reduce rotational/translation smear.
-	shiftX := ref[0].X - out[0].X
-	shiftY := ref[0].Y - out[0].Y
-	if shiftX != 0 || shiftY != 0 {
-		for i := 0; i < n; i++ {
-			out[i].X += shiftX
-			out[i].Y += shiftY
-		}
-	}
-
-	return out
-}
-
 func BuildTrack(samples []models.Sample) ([]models.Trackpoint, error) {
 	if len(samples) < 2 {
 		return nil, errors.New("not enough samples")
 	}
 
-	const (
-		minDT    = 0.016
-		maxDT    = 0.25
-		minSpeed = 0.1
-	)
-
 	track := make([]models.Trackpoint, len(samples))
 
-	var (
-		x, y float64
-		dist float64
-		// Seed heading from velocity vector if present, else zero.
-		theta = math.Atan2(samples[0].VelZ, samples[0].VelX)
-	)
+	// Re-base world coordinates so the first sample sits at origin; makes downstream
+	// math easier to read and avoids very large coordinates.
+	originX := cleanFloat(samples[0].PosX, 0)
+	originZ := cleanFloat(samples[0].PosZ, 0)
 
-	if math.IsNaN(theta) || math.IsInf(theta, 0) {
-		theta = 0
-	}
+	prevX := samples[0].PosX - originX
+	prevZ := samples[0].PosZ - originZ
+	dist := 0.0
 
-	samples[0].SmoothAx = cleanFloat(samples[0].AccelX, 0)
-	track[0] = models.Trackpoint{S: 0, X: 0, Y: 0, Theta: theta}
+	heading := worldHeading(samples[0], 0, 0)
+	track[0] = models.Trackpoint{S: 0, X: prevX, Y: prevZ, Theta: heading}
 
 	for i := 1; i < len(samples); i++ {
-		prev := samples[i-1]
-		cur := &samples[i] // pointer so we can modify SmoothAx
+		cur := samples[i]
+		curX := cur.PosX - originX
+		curZ := cur.PosZ - originZ
 
-		dt := cleanFloat(cur.Time-prev.Time, minDT)
-		dt = clamp(dt, minDT, maxDT)
+		dx := curX - prevX
+		dz := curZ - prevZ
+		step := math.Hypot(dx, dz)
+		dist += step
 
-		curAccel := cleanFloat(cur.AccelX, 0)
-		cur.SmoothAx = prev.SmoothAx*0.85 + curAccel*0.15
-
-		speed := cleanFloat(cur.Speed, prev.Speed)
-		if speed < minSpeed {
-			speed = minSpeed
+		heading = worldHeading(cur, dx, dz)
+		if heading == 0 && i > 0 {
+			heading = track[i-1].Theta
 		}
-
-		yawRate := 0.0
-		if speed > 2.0 {
-			yawRate = cur.SmoothAx / speed
-		}
-
-		theta += yawRate * dt
-
-		dx := math.Cos(theta) * speed * dt
-		dy := math.Sin(theta) * speed * dt
-
-		x += dx
-		y += dy
-
-		dist += math.Hypot(dx, dy)
 
 		track[i] = models.Trackpoint{
 			S:     dist,
-			X:     x,
-			Y:     y,
-			Theta: theta,
+			X:     curX,
+			Y:     curZ,
+			Theta: heading,
 		}
+
+		prevX = curX
+		prevZ = curZ
 	}
 
 	return track, nil
@@ -314,6 +191,21 @@ func cleanFloat(v, fallback float64) float64 {
 		return fallback
 	}
 	return v
+}
+
+// worldHeading chooses the best available heading for a sample. Prefer the game's yaw;
+// fall back to velocity vector, then path delta.
+func worldHeading(s models.Sample, dx, dz float64) float64 {
+	if !math.IsNaN(s.Yaw) && !math.IsInf(s.Yaw, 0) && s.Yaw != 0 {
+		return s.Yaw
+	}
+	if s.VelX != 0 || s.VelZ != 0 {
+		return math.Atan2(s.VelZ, s.VelX)
+	}
+	if dx != 0 || dz != 0 {
+		return math.Atan2(dz, dx)
+	}
+	return 0
 }
 
 // DetectLapsNearStart marks lap boundaries each time we come back near the start
@@ -378,100 +270,6 @@ func FindLapIndicesByDistanceWithMin(points []models.Trackpoint, expectedLap flo
 	return result
 }
 
-func NormalizeTrack(points []models.Trackpoint, targetLength float64) []models.Trackpoint {
-	if len(points) < 2 {
-		return points
-	}
-
-	var total float64
-	for i := 1; i < len(points); i++ {
-		dx := points[i].X - points[i-1].X
-		dy := points[i].Y - points[i-1].Y
-		total += math.Hypot(dx, dy)
-	}
-
-	if total == 0 {
-		return points
-	}
-
-	scale := targetLength / total
-
-	var sumX, sumY float64
-	for _, p := range points {
-		sumX += p.X
-		sumY += p.Y
-	}
-
-	cx := sumX / float64(len(points))
-	cy := sumY / float64(len(points))
-
-	out := make([]models.Trackpoint, len(points))
-
-	for i, p := range points {
-		out[i] = models.Trackpoint{
-			S:     p.S * scale,
-			X:     (p.X - cx) * scale,
-			Y:     (p.Y - cy) * scale,
-			Theta: p.Theta,
-		}
-	}
-
-	return rotateToPrincipalAxis(out)
-}
-
-func rotateToPrincipalAxis(points []models.Trackpoint) []models.Trackpoint {
-	if len(points) < 2 {
-		return points
-	}
-
-	// Compute centroid
-	var sumX, sumY float64
-	for _, p := range points {
-		sumX += p.X
-		sumY += p.Y
-	}
-	cx := sumX / float64(len(points))
-	cy := sumY / float64(len(points))
-
-	// Compute covariance elements
-	var covXX, covXY, covYY float64
-	for _, p := range points {
-		dx := p.X - cx
-		dy := p.Y - cy
-		covXX += dx * dx
-		covXY += dx * dy
-		covYY += dy * dy
-	}
-	n := float64(len(points))
-	covXX /= n
-	covXY /= n
-	covYY /= n
-
-	// Compute orientation of principal axis
-	angle := 0.5 * math.Atan2(2*covXY, covXX-covYY)
-	cosA := math.Cos(-angle)
-	sinA := math.Sin(-angle)
-
-	// Rotate all points
-	out := make([]models.Trackpoint, len(points))
-	for i, p := range points {
-		dx := p.X - cx
-		dy := p.Y - cy
-
-		x := dx*cosA - dy*sinA
-		y := dx*sinA + dy*cosA
-
-		out[i] = models.Trackpoint{
-			S:     p.S,
-			X:     x,
-			Y:     y,
-			Theta: p.Theta + (-angle),
-		}
-	}
-
-	return out
-}
-
 func CloseLoop(points []models.Trackpoint) []models.Trackpoint {
 	n := len(points)
 	if n < 2 {
@@ -493,22 +291,20 @@ func CloseLoop(points []models.Trackpoint) []models.Trackpoint {
 	for i, p := range points {
 		t := float64(i) / float64(n-1) // 0 at start, 1 at end
 		out[i] = models.Trackpoint{
-			S:     p.S,        // keep distance as-is (or recompute if you want)
-			X:     p.X - t*dx, // subtract fraction of drift
+			S:     p.S,
+			X:     p.X - t*dx,
 			Y:     p.Y - t*dy,
-			Theta: p.Theta, // heading unchanged
+			Theta: p.Theta,
 		}
 	}
 
-	// Hard snap last point to first to avoid any float leftovers
+	// Hard snap last point to first to avoid float leftovers.
 	out[n-1].X = out[0].X
 	out[n-1].Y = out[0].Y
 
 	return out
 }
 
-// NormalizeLapSegment closes a lap drift and recomputes arc length so S starts
-// at 0 and ends at lap length derived from geometry.
 func NormalizeLapSegment(points []models.Trackpoint) []models.Trackpoint {
 	closed := CloseLoop(points)
 	return RecomputeArcLength(closed)
