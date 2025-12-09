@@ -97,6 +97,7 @@
   };
   let tempUnit = "c"; // c or f
   let selectedCorner = null;
+  const isSoloSprint = () => (data?.raceType || "").toLowerCase() === "sprint" && (data?.cars?.length || 0) <= 1;
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -1306,6 +1307,12 @@
 
   function buildSegmentStats() {
     if (!segmentStatsEl) return;
+    const segmentSection = document.getElementById("segmentSection");
+    if (isSoloSprint()) {
+      if (segmentSection) segmentSection.style.display = "none";
+      return;
+    }
+    if (segmentSection) segmentSection.style.display = "";
     segmentStatsEl.innerHTML = "";
     if (!data || !data.segments || !data.segments.length) {
       segmentStatsEl.textContent = "No segments detected";
@@ -1328,17 +1335,25 @@
     const statsBySeg = new Map();
     car.segments.forEach((s) => statsBySeg.set(s.segment, s));
     const unitLabel = unit === "kmh" ? "km/h" : "mph";
+    const formatSpeed = (val) => {
+      const n = Number(val);
+      return Number.isFinite(n) ? n.toFixed(1) : "--";
+    };
     data.segments.forEach((s, idx) => {
       const stat = statsBySeg.get(idx);
       const row = document.createElement("tr");
+      const entryVal = stat ? (unit === "kmh" ? stat.entryKMH : stat.entryMPH) : NaN;
+      const minVal = stat ? (unit === "kmh" ? stat.minKMH : stat.minMPH) : NaN;
+      const avgVal = stat ? (unit === "kmh" ? stat.avgKMH : stat.avgMPH) : NaN;
+      const exitVal = stat ? (unit === "kmh" ? stat.exitKMH : stat.exitMPH) : NaN;
       row.innerHTML = `
         <td>${idx + 1}</td>
         <td>${s.type}</td>
-        <td>${stat ? (unit === "kmh" ? stat.entryKMH : stat.entryMPH).toFixed(1) : "--"} ${unitLabel}</td>
-        <td>${stat ? (unit === "kmh" ? stat.minKMH : stat.minMPH).toFixed(1) : "--"} ${unitLabel}</td>
-        <td>${stat ? (unit === "kmh" ? stat.avgKMH : stat.avgMPH).toFixed(1) : "--"} ${unitLabel}</td>
-        <td>${stat ? (unit === "kmh" ? stat.exitKMH : stat.exitMPH).toFixed(1) : "--"} ${unitLabel}</td>
-        <td>${stat && isFinite(stat.time) ? stat.time.toFixed(2) : "--"} s</td>
+        <td>${formatSpeed(entryVal)} ${unitLabel}</td>
+        <td>${formatSpeed(minVal)} ${unitLabel}</td>
+        <td>${formatSpeed(avgVal)} ${unitLabel}</td>
+        <td>${formatSpeed(exitVal)} ${unitLabel}</td>
+        <td>${stat && Number.isFinite(Number(stat.time)) ? Number(stat.time).toFixed(2) : "--"} s</td>
       `;
       table.appendChild(row);
     });
@@ -1349,6 +1364,11 @@
 
   function buildSegmentGhostControls() {
     if (!segmentGhostEl) return;
+    if (isSoloSprint()) {
+      segmentGhostEl.style.display = "none";
+      return;
+    }
+    segmentGhostEl.style.display = "";
     segmentGhostEl.innerHTML = "";
     const cars = data?.cars || [];
     if (!cars.length) return;
