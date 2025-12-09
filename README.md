@@ -1,5 +1,5 @@
 # 🏁 Forza Telemetry Playground
-> Turn raw FH5 / Forza Motorsport CSV dumps into a cinematic lap explorer with zero setup.
+> Turn raw FH5 / Forza Motorsport CSV exports into a cinematic lap explorer with zero setup.
 
 ## Why this is fun
 - ⚡️ Drop in one or many CSVs; laps, sectors, and race type are auto-detected.
@@ -17,8 +17,8 @@ go run . -file path/to/car1.csv -file path/to/car2.csv
 # or point at a folder (recursive):
 go run . -folder telemetry/
 ```
-- Default behavior writes `web/data.json` and serves the viewer at `http://localhost:8080`.
-- Add `-out results.json` to export only, or `-serve=false` to skip the UI.
+- By default it writes `web/data.json` and serves the viewer at `http://localhost:8080`.
+- Add `-out results.json` to export only, or `-serve=false` to skip hosting the UI.
 
 ## Data it expects
 The loader is forgiving but needs these columns (case-insensitive) in your CSV:
@@ -41,9 +41,9 @@ Highly recommended for richer visuals: `speed_kph`/`speed_mph`, `pos_x`/`pos_y`/
 
 ## Outputs
 - `web/data.json` — everything the viewer needs (master track, per-car traces, events, stats).
-- `stdout` — JSON payload when `-serve=false -out` is omitted (useful for piping into other tools).
+- `stdout` — JSON payload when `-serve=false -out` is omitted; useful for piping into other tools.
 
 ## Tips
 - If lap detection is noisy on tight tracks, bump `-start-finish-radius` to ~15–20 or set an explicit `-lap-count`.
 - Feeding multiple cars lets the viewer detect overtakes and visualize deltas on the shared master lap.
-- The pipeline drops pre-race/post-race zeroed samples automatically—feed it the raw game dump. 
+- The pipeline drops pre- and post-race zeroed samples automatically—feed it the raw game dump. 
