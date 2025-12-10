@@ -1,4 +1,4 @@
-![](https://github.com/A-zrael/Forza-Horizon-5-Telemetry-Viewer/blob/main/Telemetry%20Viewer%20icon.jpeg?raw=true)
+![](https://github.com/A-zrael/Forza-Horizon-5-Telemetry-Viewer/blob/main/icon.jpeg?raw=true)
 
 # 🏁 Forza Telemetry Viewer
 > Turn raw FH5 / Forza Motorsport CSV exports into a cinematic lap explorer with zero setup.
